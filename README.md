@@ -4,7 +4,7 @@
 
 Reimplementação Windows-native do app Dante CLI (originalmente macOS/SwiftUI), seguindo o plano técnico em `prompt.md`. Sem Electron, sem WebView na UI principal, sem JavaScript no terminal. Camada Core portável reaproveitada no futuro para Linux/macOS.
 
-## Status atual (1.0.16-alpha)
+## Status atual (1.0.17-alpha)
 
 **Fases concluídas (0–2 do roadmap):**
 - ✅ Scaffolding completo (CMake superbuild, 5 libs + app)
@@ -107,12 +107,12 @@ cd C:\Dev\DANTE-CLI-WIN
 
 # Gerar instalador (Inno Setup ou NSIS)
 .\scripts\make-installer.ps1
-# → dist\installer\DanteCLI-Setup-1.0.16-x64.exe
+# → dist\installer\DanteCLI-Setup-1.0.17-x64.exe
 ```
 
 ## Como instalar (usuário final)
 
-1. Baixe `DanteCLI-Setup-1.0.16-x64.exe` da seção Releases.
+1. Baixe `DanteCLI-Setup-1.0.17-x64.exe` da seção Releases.
 2. Execute. O instalador pede privilégios de administrador.
 3. Aceite a licença MIT.
 4. (Opcional) Marque "Adicionar 'dante-cli' ao PATH do sistema" durante a instalação.

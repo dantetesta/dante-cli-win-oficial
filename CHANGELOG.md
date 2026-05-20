@@ -3,6 +3,13 @@
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 Versionamento [SemVer](https://semver.org/lang/pt-BR/).
 
+## [1.0.17] — 2026-05-20
+
+### Corrigido
+- **Relógio "REC mm:ss" travado em 00:00 durante gravação**. O label era recalculado dentro do `WM_PAINT`, mas nada disparava `InvalidateRect` enquanto o microfone gravava (nenhum byte chega do ConPTY pra acordar o repaint). Agora o timer de 1 s força `InvalidateRect` quando `g_voice.recording == TRUE`.
+- Timer de status acelerado de 2 s → **1 s** (granularidade necessária pro relógio do mic; o RAM no rodapé também atualiza mais rápido como bônus).
+- Cap de gravação de 60 s passou a ser verdadeiramente aplicado — se o usuário esquecer o mic ligado, ele para e faz upload sozinho aos 60 s.
+
 ## [1.0.16] — 2026-05-20
 
 ### Estabilidade

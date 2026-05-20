@@ -23,7 +23,7 @@
 #include <wchar.h>
 
 #define APP_NAME           L"Dante CLI"
-#define APP_VERSION        L"1.0.16-stub"
+#define APP_VERSION        L"1.0.17-stub"
 #define APP_BUILD_DATE     L"2026"
 #define APP_URL            L"https://github.com/dantetesta/dante-cli"
 #define APP_DOCS_URL       L"https://github.com/dantetesta/dante-cli/blob/main/INSTALL.md"

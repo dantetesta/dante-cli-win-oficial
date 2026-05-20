@@ -72,7 +72,7 @@ static PFN_ClosePseudoConsole  pClosePseudoConsole  = NULL;
  *                              CONSTANTS
  * ========================================================================= */
 
-#define APP_VERSION_W   L"1.0.16"
+#define APP_VERSION_W   L"1.0.17"
 #define APP_NAME_W      L"Dante CLI"
 #define APP_WINDOW_CLS  L"DanteCLIMainWindow"
 
@@ -3702,7 +3702,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             InitializeCriticalSection(&g_app.lock);
             voice_init();
 
-            g_app.statsTimer = SetTimer(hWnd, 1, 2000, NULL);
+            /* 1 s tick — also drives the REC mm:ss label during voice
+             * capture and the status-bar RAM update. */
+            g_app.statsTimer = SetTimer(hWnd, 1, 1000, NULL);
             g_app.repaintTimer = SetTimer(hWnd, 2, 33, NULL);
             g_app.persistTimer = SetTimer(hWnd, 3, 1500, NULL);
             g_app.dragTabIdx = -1;
@@ -3928,6 +3930,16 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_TIMER:
             if (wParam == 1) {
                 update_status();
+                /* While recording, the REC mm:ss label must tick visibly.
+                 * Without this the toolbar button stayed at "REC 00:00"
+                 * because nothing else was invalidating during voice cap. */
+                if (g_voice.recording) {
+                    /* Enforce hard cap so a forgotten mic doesn't gravar
+                     * indefinidamente — Whisper rejects very long takes. */
+                    DWORD elapsed = (GetTickCount() - g_voice.startTick) / 1000;
+                    if (elapsed >= VOICE_MAX_SECONDS) voice_stop_and_upload();
+                    InvalidateRect(hWnd, NULL, FALSE);
+                }
             } else if (wParam == 2) {
                 if (g_app.pendingRepaint) { g_app.pendingRepaint = 0; InvalidateRect(hWnd, NULL, FALSE); }
             } else if (wParam == 3) {
