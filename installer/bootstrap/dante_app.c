@@ -72,7 +72,7 @@ static PFN_ClosePseudoConsole  pClosePseudoConsole  = NULL;
  *                              CONSTANTS
  * ========================================================================= */
 
-#define APP_VERSION_W   L"1.0.18"
+#define APP_VERSION_W   L"1.0.19"
 #define APP_NAME_W      L"Dante CLI"
 #define APP_WINDOW_CLS  L"DanteCLIMainWindow"
 
@@ -89,6 +89,7 @@ static PFN_ClosePseudoConsole  pClosePseudoConsole  = NULL;
 #define MAX_COLS        400
 #define MAX_ROWS        200
 #define SCROLLBACK_CAP  5000
+#define TERM_HEADER_H   38
 
 /* Tokyo Night palette — matches the Swift default theme. */
 #define COL_BG          RGB(0x1A, 0x1B, 0x26)
@@ -482,6 +483,7 @@ typedef struct {
     HWND     hWnd;
     HWND     hStatus;
     HFONT    hFontUI;
+    HFONT    hFontUIBold;
     HFONT    hFontMono;
     HFONT    hFontMonoBold;
     HFONT    hFontEmoji;
@@ -1844,8 +1846,171 @@ enum {
     IDM_TAB_CLOSE_OTHERS,
     IDM_TAB_NEW_PWSH7,
     IDM_TAB_NEW_CMD,
+    IDM_TAB_EMOJI_PICK,
+    IDM_TAB_EMOJI_NONE,
     IDM_TAB_COLOR_BASE = 0x1200,    /* +0..11 */
 };
+
+/* Curated set of "developer-friendly" emoji shown in the picker. */
+static const wchar_t* kEmojiPalette[] = {
+    L"\U0001F4BB", L"\U0001F4C1", L"\U0001F4C2", L"⚡",       L"\U0001F525",
+    L"\U0001F680", L"\U0001F40D", L"\U0001F981", L"\U0001F436", L"\U0001F431",
+    L"\U0001F981", L"\U0001F427", L"\U0001F47E", L"\U0001F916", L"✨",
+    L"\U0001F9EA", L"\U0001F50D", L"\U0001F511", L"\U0001F512", L"\U0001F4E6",
+    L"\U0001F4DD", L"\U0001F4CA", L"\U0001F3AF", L"\U0001F4A1", L"\U0001F308",
+    L"\U0001F31F", L"⭐",       L"\U0001F4CC", L"\U0001F4CD", L"\U0001F3F7",
+    L"\U0001F4DF", L"\U0001F4DE", L"\U0001F4E1", L"\U0001F310", L"\U0001F30E",
+    L"☕",     L"\U0001F37A", L"\U0001F355", L"\U0001F354", L"\U0001F354",
+};
+#define EMOJI_PALETTE_COUNT ((int)(sizeof(kEmojiPalette)/sizeof(kEmojiPalette[0])))
+
+/* ---- Emoji picker popup ---------------------------------------------- */
+typedef struct {
+    HWND hWnd;
+    int  selected;       /* picked index, -1 on cancel */
+    int  hoverIdx;
+    int  targetTabIdx;
+} EmojiPickerCtx;
+
+static EmojiPickerCtx* g_emojiCtx = NULL;
+
+static RECT emoji_cell_rect(int idx) {
+    /* 8 cols × 5 rows, 48 px each */
+    int col = idx % 8;
+    int row = idx / 8;
+    RECT r;
+    r.left = 14 + col * 50;
+    r.top  = 56 + row * 50;
+    r.right  = r.left + 44;
+    r.bottom = r.top  + 44;
+    return r;
+}
+
+static int emoji_hit_test(int x, int y) {
+    for (int i = 0; i < EMOJI_PALETTE_COUNT; ++i) {
+        RECT r = emoji_cell_rect(i);
+        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return i;
+    }
+    return -1;
+}
+
+static LRESULT CALLBACK EmojiPickerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_ERASEBKGND: return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(hWnd, &ps);
+            RECT cli; GetClientRect(hWnd, &cli);
+            HDC mem = CreateCompatibleDC(dc);
+            HBITMAP bmp = CreateCompatibleBitmap(dc, cli.right, cli.bottom);
+            HBITMAP oldBmp = (HBITMAP)SelectObject(mem, bmp);
+            fill_rect_color(mem, &cli, COL_BG_SIDE);
+
+            draw_text_w(mem, 18, 18, L"Escolha um emoji para a aba",
+                        COL_FG, g_app.hFontUIBold);
+
+            for (int i = 0; i < EMOJI_PALETTE_COUNT; ++i) {
+                RECT r = emoji_cell_rect(i);
+                BOOL hover = (g_emojiCtx->hoverIdx == i);
+                draw_rounded_rect(mem, r,
+                                  hover ? COL_BG_CHIP_H : COL_BG_CHIP, 0, 8);
+                SIZE sz;
+                HFONT old = (HFONT)SelectObject(mem, g_app.hFontEmoji);
+                SetBkMode(mem, TRANSPARENT);
+                SetTextColor(mem, COL_FG);
+                GetTextExtentPoint32W(mem, kEmojiPalette[i],
+                                      (int)wcslen(kEmojiPalette[i]), &sz);
+                TextOutW(mem,
+                         r.left + ((r.right - r.left) - sz.cx) / 2,
+                         r.top  + ((r.bottom - r.top) - sz.cy) / 2,
+                         kEmojiPalette[i],
+                         (int)wcslen(kEmojiPalette[i]));
+                SelectObject(mem, old);
+            }
+
+            BitBlt(dc, 0, 0, cli.right, cli.bottom, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, oldBmp);
+            DeleteObject(bmp);
+            DeleteDC(mem);
+            EndPaint(hWnd, &ps);
+            return 0;
+        }
+        case WM_MOUSEMOVE: {
+            int x = LOWORD(lParam), y = HIWORD(lParam);
+            int h = emoji_hit_test(x, y);
+            if (h != g_emojiCtx->hoverIdx) {
+                g_emojiCtx->hoverIdx = h;
+                InvalidateRect(hWnd, NULL, FALSE);
+            }
+            return 0;
+        }
+        case WM_LBUTTONDOWN: {
+            int x = LOWORD(lParam), y = HIWORD(lParam);
+            int idx = emoji_hit_test(x, y);
+            if (idx >= 0) {
+                g_emojiCtx->selected = idx;
+                DestroyWindow(hWnd);
+            }
+            return 0;
+        }
+        case WM_KEYDOWN:
+            if (wParam == VK_ESCAPE) DestroyWindow(hWnd);
+            return 0;
+        case WM_CLOSE: DestroyWindow(hWnd); return 0;
+        case WM_DESTROY:
+            PostThreadMessageW(GetCurrentThreadId(), WM_NULL, 0, 0);
+            return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+static void show_emoji_picker(int tabIdx) {
+    static BOOL registered = FALSE;
+    if (!registered) {
+        WNDCLASSEXW wc = { sizeof(wc) };
+        wc.lpfnWndProc = EmojiPickerWndProc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.hCursor = LoadCursorW(NULL, IDC_HAND);
+        wc.hbrBackground = NULL;
+        wc.lpszClassName = L"DanteEmojiPicker";
+        RegisterClassExW(&wc);
+        registered = TRUE;
+    }
+
+    EmojiPickerCtx ctx = { NULL, -1, -1, tabIdx };
+    g_emojiCtx = &ctx;
+
+    RECT pr; GetWindowRect(g_app.hWnd, &pr);
+    int W = 8 * 50 + 28;
+    int H = 56 + 5 * 50 + 16;
+    int x = pr.left + ((pr.right - pr.left) - W) / 2;
+    int y = pr.top  + ((pr.bottom - pr.top) - H) / 2;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        L"DanteEmojiPicker", L"Emoji da aba",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        x, y, W, H, g_app.hWnd, NULL, GetModuleHandleW(NULL), NULL);
+    ctx.hWnd = dlg;
+    ShowWindow(dlg, SW_SHOW);
+    SetFocus(dlg);
+    EnableWindow(g_app.hWnd, FALSE);
+
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+        if (!IsWindow(dlg)) break;
+    }
+    EnableWindow(g_app.hWnd, TRUE);
+    SetForegroundWindow(g_app.hWnd);
+
+    if (ctx.selected >= 0 && tabIdx >= 0 && tabIdx < g_app.tabCount) {
+        str_copy_w(g_app.tabs[tabIdx]->emoji, 8, kEmojiPalette[ctx.selected]);
+        schedule_persist();
+        InvalidateRect(g_app.hWnd, NULL, FALSE);
+    }
+    g_emojiCtx = NULL;
+}
 
 static void duplicate_tab(int idx) {
     if (idx < 0 || idx >= g_app.tabCount || g_app.tabCount >= MAX_TABS) return;
@@ -1877,6 +2042,9 @@ static void show_tab_context_menu(HWND hWnd, int tabIdx, int x, int y) {
                     IDM_TAB_COLOR_BASE + i, names[i]);
     }
     AppendMenuW(m, MF_POPUP, (UINT_PTR)colors, L"Cor");
+    AppendMenuW(m, MF_STRING, IDM_TAB_EMOJI_PICK, L"Emoji...");
+    if (g_app.tabs[tabIdx]->emoji[0])
+        AppendMenuW(m, MF_STRING, IDM_TAB_EMOJI_NONE, L"Remover emoji");
 
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_TAB_NEW_PWSH7, L"Nova aba (PowerShell 7)");
@@ -1915,6 +2083,11 @@ static void show_tab_context_menu(HWND hWnd, int tabIdx, int x, int y) {
         open_new_tab(L"cmd");
     } else if (cmd >= IDM_TAB_COLOR_BASE && cmd < IDM_TAB_COLOR_BASE + 12) {
         g_app.tabs[tabIdx]->colorIdx = cmd - IDM_TAB_COLOR_BASE;
+        schedule_persist();
+    } else if (cmd == IDM_TAB_EMOJI_PICK) {
+        show_emoji_picker(tabIdx);
+    } else if (cmd == IDM_TAB_EMOJI_NONE) {
+        g_app.tabs[tabIdx]->emoji[0] = 0;
         schedule_persist();
     }
 
@@ -3562,6 +3735,125 @@ static int active_tab_index(void) {
     return idx;
 }
 
+/* Pick a foreground colour that contrasts with the given background. */
+static COLORREF contrast_text_color(COLORREF c) {
+    int r = GetRValue(c), g = GetGValue(c), b = GetBValue(c);
+    /* Relative luminance (sRGB approximation). */
+    double L = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0;
+    return L > 0.55 ? RGB(0x1A, 0x1B, 0x26) : RGB(0xFF, 0xFF, 0xFF);
+}
+
+/* Mix two colours additively, t ∈ [0..1]. */
+static COLORREF mix_color(COLORREF a, COLORREF b, double t) {
+    int ar = GetRValue(a), ag = GetGValue(a), ab = GetBValue(a);
+    int br = GetRValue(b), bg = GetGValue(b), bb = GetBValue(b);
+    int r = (int)(ar + (br - ar) * t);
+    int g = (int)(ag + (bg - ag) * t);
+    int x = (int)(ab + (bb - ab) * t);
+    return RGB(r, g, x);
+}
+
+/* Header bar above each terminal cell. Same colour as the tab chip — this
+ * is the visual link the user wanted: tab colour ↔ terminal head colour.
+ * Contents: emoji + title (bold) + cwd (dim) + memory chip on the right. */
+static void draw_terminal_header(HDC dc, RECT hdr, Tab* t, BOOL hasFocus) {
+    COLORREF acc   = (t->colorIdx >= 0) ? kTabColors[t->colorIdx] : COL_ACCENT;
+    COLORREF fg    = contrast_text_color(acc);
+    COLORREF fgDim = mix_color(fg, acc, 0.40);
+
+    fill_rect_color(dc, &hdr, acc);
+
+    /* Hamburger icon — 3 lines on the left. */
+    HPEN pen = CreatePen(PS_SOLID, 2, fg);
+    HGDIOBJ op = SelectObject(dc, pen);
+    int hx = hdr.left + 14;
+    int hy = hdr.top  + 12;
+    for (int i = 0; i < 3; ++i) {
+        MoveToEx(dc, hx, hy + i * 6, NULL);
+        LineTo(dc, hx + 16, hy + i * 6);
+    }
+    SelectObject(dc, op);
+    DeleteObject(pen);
+
+    int x = hdr.left + 44;
+
+    /* Emoji */
+    if (t->emoji[0]) {
+        draw_text_w(dc, x, hdr.top + 8, t->emoji, fg, g_app.hFontEmoji);
+        x += 26;
+    }
+
+    /* Title (bold) */
+    HFONT oldFont = (HFONT)SelectObject(dc, g_app.hFontUIBold);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, fg);
+    TextOutW(dc, x, hdr.top + 10, t->title, (int)wcslen(t->title));
+    SIZE titleSz;
+    GetTextExtentPoint32W(dc, t->title, (int)wcslen(t->title), &titleSz);
+    SelectObject(dc, oldFont);
+
+    /* cwd (dim, lighter weight) — clipped to remaining space */
+    if (t->session && t->session->cwd[0]) {
+        int cwdX = x + titleSz.cx + 12;
+        int chipReserve = 110;
+        RECT cwdRc = { cwdX, hdr.top + 11, hdr.right - chipReserve, hdr.bottom - 6 };
+        if (cwdRc.right > cwdRc.left + 30) {
+            HFONT oldF = (HFONT)SelectObject(dc, g_app.hFontUI);
+            SetTextColor(dc, fgDim);
+            DrawTextW(dc, t->session->cwd, -1, &cwdRc,
+                      DT_SINGLELINE | DT_LEFT | DT_END_ELLIPSIS | DT_VCENTER);
+            SelectObject(dc, oldF);
+        }
+    }
+
+    /* Memory chip on the right */
+    if (t->session && t->session->pid) {
+        PROCESS_MEMORY_COUNTERS_EX pmc = {0};
+        pmc.cb = sizeof(pmc);
+        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                FALSE, t->session->pid);
+        if (h) {
+            if (GetProcessMemoryInfo(h, (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc))) {
+                wchar_t chip[32];
+                double mb = (double)pmc.PrivateUsage / (1024.0 * 1024.0);
+                _snwprintf_s(chip, 32, _TRUNCATE,
+                             mb < 1000 ? L"%.0f M" : L"%.1f G",
+                             mb < 1000 ? mb : mb / 1024.0);
+                SIZE sz;
+                HFONT oldF = (HFONT)SelectObject(dc, g_app.hFontUI);
+                GetTextExtentPoint32W(dc, chip, (int)wcslen(chip), &sz);
+                RECT chipRc = {
+                    hdr.right - sz.cx - 20, hdr.top + 8,
+                    hdr.right - 8,          hdr.bottom - 8
+                };
+                COLORREF chipBg = mix_color(acc, RGB(0,0,0), 0.35);
+                draw_rounded_rect(dc, chipRc, chipBg, 0, 10);
+                SetTextColor(dc, fg);
+                TextOutW(dc, chipRc.left + 6, chipRc.top + 3,
+                         chip, (int)wcslen(chip));
+                SelectObject(dc, oldF);
+            }
+            CloseHandle(h);
+        }
+    }
+
+    /* Subtle separator at the bottom of the header. */
+    HBRUSH sep = CreateSolidBrush(mix_color(acc, RGB(0,0,0), 0.20));
+    RECT sepR = { hdr.left, hdr.bottom - 1, hdr.right, hdr.bottom };
+    FillRect(dc, &sepR, sep);
+    DeleteObject(sep);
+
+    /* Mark "active cell" with a slight extra inset border. */
+    if (hasFocus && g_app.splitLayout != PRESET_SINGLE) {
+        HPEN bp = CreatePen(PS_SOLID, 2, fg);
+        HGDIOBJ obp = SelectObject(dc, bp);
+        MoveToEx(dc, hdr.left, hdr.bottom, NULL);
+        LineTo(dc, hdr.right, hdr.bottom);
+        SelectObject(dc, obp);
+        DeleteObject(bp);
+    }
+}
+
 /* Render one terminal cell. Computes grid resize for the inner area. */
 static void draw_terminal_cell(HDC dc, const RECT* rc, int tabIdx, BOOL hasFocus) {
     const ColorScheme* sc = current_scheme();
@@ -3580,17 +3872,24 @@ static void draw_terminal_cell(HDC dc, const RECT* rc, int tabIdx, BOOL hasFocus
     Tab* t = g_app.tabs[tabIdx];
     if (!t) return;
 
-    /* Tab indicator strip (left side of terminal area, matches chip color) */
-    COLORREF acc = (t->colorIdx >= 0) ? kTabColors[t->colorIdx] : COL_ACCENT;
-    RECT strip = { rc->left, rc->top, rc->left + 3, rc->bottom };
-    fill_rect_color(dc, &strip, acc);
+    /* Header bar — same colour as the tab chip. Replaces the old 3-px strip. */
+    RECT header = *rc;
+    header.bottom = header.top + TERM_HEADER_H;
+    draw_terminal_header(dc, header, t, hasFocus);
 
-    /* Focus border */
+    /* Body rect for the terminal content (below the header). */
+    RECT body = *rc;
+    body.top += TERM_HEADER_H;
+    fill_rect_color(dc, &body, sc->bg);
+    rc = &body;
+    COLORREF acc = (t->colorIdx >= 0) ? kTabColors[t->colorIdx] : COL_ACCENT;
+
+    /* Focus border (subtle) */
     if (hasFocus && g_app.splitLayout != PRESET_SINGLE) {
-        HPEN pen = CreatePen(PS_SOLID, 2, acc);
+        HPEN pen = CreatePen(PS_SOLID, 1, acc);
         HGDIOBJ op = SelectObject(dc, pen);
         HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
-        Rectangle(dc, rc->left + 2, rc->top + 1, rc->right - 1, rc->bottom - 1);
+        Rectangle(dc, rc->left, rc->top, rc->right - 1, rc->bottom - 1);
         SelectObject(dc, op); SelectObject(dc, ob);
         DeleteObject(pen);
     }
@@ -3996,6 +4295,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_app.hFontUI = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+            g_app.hFontUIBold = CreateFontW(-14, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                                        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
             g_app.hFontMono = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                           CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Cascadia Code");
@@ -4374,6 +4676,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             DeleteObject(g_app.penDiv);
             DeleteObject(g_app.penAccent);
             DeleteObject(g_app.hFontUI);
+            DeleteObject(g_app.hFontUIBold);
             DeleteObject(g_app.hFontMono);
             DeleteObject(g_app.hFontMonoBold);
             DeleteObject(g_app.hFontEmoji);

@@ -3,6 +3,24 @@
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 Versionamento [SemVer](https://semver.org/lang/pt-BR/).
 
+## [1.0.19] — 2026-05-20
+
+### Adicionado
+- **Header colorido em cada terminal** — a área do terminal agora começa com uma barra de 38 px na cor da aba (mesma `kTabColors[colorIdx]`). Conecta visualmente a chip da aba com o conteúdo abaixo, igual ao macOS:
+  - **Hambúrguer** (3 traços) à esquerda → reservado pro menu por-célula (próxima versão).
+  - **Emoji** da aba (clicável via menu de contexto).
+  - **Título em bold** com cor de contraste automática (texto preto sobre claro / branco sobre escuro via cálculo de luminância).
+  - **cwd em cinza translúcido** com `DT_END_ELLIPSIS` quando não cabe.
+  - **Chip de RAM** à direita (`PrivateUsage` do PID da sessão) — atualiza junto com o repaint.
+- **Emoji picker visual** — grid 8×5 com 40 emojis devs-friendly (📁 📂 ⚡ 🔥 🚀 🐍 🦀 🐶 🐱 etc). Click aplica. Acessível pelo menu de contexto da aba (botão direito → "Emoji...").
+- Item "Remover emoji" no menu de contexto (só aparece se a aba tem emoji).
+- O strip lateral de 3 px (que existia antes) foi substituído pelo header — fica mais limpo e mais informativo.
+
+### Detalhes técnicos
+- `contrast_text_color()` calcula luminância sRGB pra decidir texto preto/branco — funciona com toda a paleta de 12 cores.
+- `mix_color()` mistura RGB pra calcular `cwdDim` (texto secundário) e o chip de RAM (sutil escurecido sobre o accent).
+- Nova fonte `hFontUIBold` (Segoe UI Bold, -14px) criada no `WM_CREATE`.
+
 ## [1.0.18] — 2026-05-20
 
 ### Adicionado
