@@ -72,7 +72,7 @@ static PFN_ClosePseudoConsole  pClosePseudoConsole  = NULL;
  *                              CONSTANTS
  * ========================================================================= */
 
-#define APP_VERSION_W   L"1.0.20"
+#define APP_VERSION_W   L"1.0.22"
 #define APP_NAME_W      L"Dante CLI"
 #define APP_WINDOW_CLS  L"DanteCLIMainWindow"
 
@@ -529,6 +529,10 @@ typedef struct {
     int          splitLayout;                       /* index into kPresets[] */
     int          splitSlots[MAX_SPLIT_CELLS];       /* indices into tabs[]; -1 = empty */
     int          splitActiveCell;                   /* which cell currently has focus */
+    int          zoomedCell;                        /* -1 = no zoom; cell idx otherwise */
+    RECT         zoomBtnRect[MAX_SPLIT_CELLS];      /* updated by draw_terminal_header */
+    RECT         sizeBtnRect[MAX_SPLIT_CELLS];      /* resize button rects */
+    SplitCell    customCells[MAX_SPLIT_CELLS];      /* w==0 → use preset cell */
 } App;
 
 static App g_app;
@@ -590,8 +594,13 @@ static void show_settings_dialog(void);
 static void show_split_menu(HWND hWnd, int x, int y);
 static void set_split_layout(int layoutId);
 static void show_layout_gallery(void);
-static void draw_terminal_cell(HDC dc, const RECT* rc, int tabIdx, BOOL hasFocus);
+static void draw_terminal_cell(HDC dc, const RECT* rc, int tabIdx, BOOL hasFocus, int cellIdx);
 static int  active_tab_index(void);
+static void toggle_zoom(int cellIdx);
+static int  hit_test_zoom_btn(int x, int y);
+static int  hit_test_size_btn(int x, int y);
+static const SplitCell* resolve_cell(int idx);
+static void show_resize_popup(int cellIdx, int screenX, int screenY);
 static RECT split_cell_rect(const RECT* parent, const SplitCell* c);
 static wchar_t* utf8_to_w_dup(const char* s, int n);
 static char* w_to_utf8_dup(const wchar_t* w);
@@ -2579,6 +2588,8 @@ static void set_split_layout(int presetIdx) {
     if (presetIdx < 0 || presetIdx >= PRESET_COUNT) return;
     g_app.splitLayout = presetIdx;
     g_app.splitActiveCell = 0;
+    g_app.zoomedCell = -1;     /* reset zoom whenever the layout changes */
+    memset(g_app.customCells, 0, sizeof(g_app.customCells));
     int cells = kPresets[presetIdx].cellCount;
     /* Auto-fill slots with the first N tabs */
     for (int i = 0; i < MAX_SPLIT_CELLS; ++i) g_app.splitSlots[i] = -1;
@@ -2976,6 +2987,8 @@ static void draw_cheatsheet(HDC dc, const RECT* cli) {
         { L"Backspace",     L"Apagar 1 caractere" },
         { L"Alt+Backspace", L"Apagar palavra (boundary leve)" },
         { L"Ctrl+Backspace",L"Apagar palavra anterior (kill-word)" },
+        { L"Ctrl+Shift+Z",  L"Zoom 90% da célula ativa (toggle)" },
+        { L"Esc",           L"Sair do zoom (se ativo)" },
     };
 
     /* Dimmed backdrop */
@@ -4176,7 +4189,7 @@ static COLORREF mix_color(COLORREF a, COLORREF b, double t) {
 /* Header bar above each terminal cell. Same colour as the tab chip — this
  * is the visual link the user wanted: tab colour ↔ terminal head colour.
  * Contents: emoji + title (bold) + cwd (dim) + memory chip on the right. */
-static void draw_terminal_header(HDC dc, RECT hdr, Tab* t, BOOL hasFocus) {
+static void draw_terminal_header(HDC dc, RECT hdr, Tab* t, BOOL hasFocus, int cellIdx) {
     COLORREF acc   = (t->colorIdx >= 0) ? kTabColors[t->colorIdx] : COL_ACCENT;
     COLORREF fg    = contrast_text_color(acc);
     COLORREF fgDim = mix_color(fg, acc, 0.40);
@@ -4226,7 +4239,52 @@ static void draw_terminal_header(HDC dc, RECT hdr, Tab* t, BOOL hasFocus) {
         }
     }
 
-    /* Memory chip on the right */
+    /* Right-edge buttons cluster: ↔ resize (split only), ⤢ zoom (split only).
+     * Each one stores its hit rect for the global mouse handler.        */
+    int rightCursor = hdr.right - 10;
+
+    /* Zoom button */
+    if (g_app.splitLayout != PRESET_SINGLE && cellIdx >= 0 && cellIdx < MAX_SPLIT_CELLS) {
+        RECT btn = { rightCursor - 28, hdr.top + 6, rightCursor, hdr.bottom - 6 };
+        BOOL isZoomed = (g_app.zoomedCell == cellIdx);
+        COLORREF btnBg = mix_color(acc, RGB(0,0,0), isZoomed ? 0.55 : 0.35);
+        draw_rounded_rect(dc, btn, btnBg, 0, 8);
+        const wchar_t* icon = isZoomed ? L"⤡" : L"⤢";
+        SIZE sz;
+        HFONT old = (HFONT)SelectObject(dc, g_app.hFontEmoji);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, fg);
+        GetTextExtentPoint32W(dc, icon, (int)wcslen(icon), &sz);
+        TextOutW(dc, btn.left + ((btn.right - btn.left) - sz.cx) / 2,
+                 btn.top  + ((btn.bottom - btn.top) - sz.cy) / 2,
+                 icon, (int)wcslen(icon));
+        SelectObject(dc, old);
+        g_app.zoomBtnRect[cellIdx] = btn;
+        rightCursor = btn.left - 6;
+    }
+
+    /* Resize button (↔) */
+    if (g_app.splitLayout != PRESET_SINGLE && cellIdx >= 0 && cellIdx < MAX_SPLIT_CELLS) {
+        RECT btn = { rightCursor - 28, hdr.top + 6, rightCursor, hdr.bottom - 6 };
+        COLORREF btnBg = mix_color(acc, RGB(0,0,0), 0.35);
+        draw_rounded_rect(dc, btn, btnBg, 0, 8);
+        const wchar_t* icon = L"⇲";
+        SIZE sz;
+        HFONT old = (HFONT)SelectObject(dc, g_app.hFontEmoji);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, fg);
+        GetTextExtentPoint32W(dc, icon, (int)wcslen(icon), &sz);
+        TextOutW(dc, btn.left + ((btn.right - btn.left) - sz.cx) / 2,
+                 btn.top  + ((btn.bottom - btn.top) - sz.cy) / 2,
+                 icon, (int)wcslen(icon));
+        SelectObject(dc, old);
+        g_app.sizeBtnRect[cellIdx] = btn;
+        rightCursor = btn.left - 6;
+    }
+
+    int zoomBtnRight = rightCursor;
+
+    /* Memory chip on the right (positioned to the LEFT of the zoom btn) */
     if (t->session && t->session->pid) {
         PROCESS_MEMORY_COUNTERS_EX pmc = {0};
         pmc.cb = sizeof(pmc);
@@ -4243,8 +4301,8 @@ static void draw_terminal_header(HDC dc, RECT hdr, Tab* t, BOOL hasFocus) {
                 HFONT oldF = (HFONT)SelectObject(dc, g_app.hFontUI);
                 GetTextExtentPoint32W(dc, chip, (int)wcslen(chip), &sz);
                 RECT chipRc = {
-                    hdr.right - sz.cx - 20, hdr.top + 8,
-                    hdr.right - 8,          hdr.bottom - 8
+                    zoomBtnRight - sz.cx - 12, hdr.top + 8,
+                    zoomBtnRight,              hdr.bottom - 8
                 };
                 COLORREF chipBg = mix_color(acc, RGB(0,0,0), 0.35);
                 draw_rounded_rect(dc, chipRc, chipBg, 0, 10);
@@ -4274,8 +4332,9 @@ static void draw_terminal_header(HDC dc, RECT hdr, Tab* t, BOOL hasFocus) {
     }
 }
 
-/* Render one terminal cell. Computes grid resize for the inner area. */
-static void draw_terminal_cell(HDC dc, const RECT* rc, int tabIdx, BOOL hasFocus) {
+/* Render one terminal cell. cellIdx ∈ [0..MAX_SPLIT_CELLS-1] or -1 (single
+ * tab mode). hasFocus draws the focus border in split mode.            */
+static void draw_terminal_cell(HDC dc, const RECT* rc, int tabIdx, BOOL hasFocus, int cellIdx) {
     const ColorScheme* sc = current_scheme();
     fill_rect_color(dc, rc, sc->bg);
 
@@ -4295,7 +4354,7 @@ static void draw_terminal_cell(HDC dc, const RECT* rc, int tabIdx, BOOL hasFocus
     /* Header bar — same colour as the tab chip. Replaces the old 3-px strip. */
     RECT header = *rc;
     header.bottom = header.top + TERM_HEADER_H;
-    draw_terminal_header(dc, header, t, hasFocus);
+    draw_terminal_header(dc, header, t, hasFocus, cellIdx);
 
     /* Body rect for the terminal content (below the header). */
     RECT body = *rc;
@@ -4376,6 +4435,16 @@ static void draw_terminal_cell(HDC dc, const RECT* rc, int tabIdx, BOOL hasFocus
     t->grid.dirty = 0;
 }
 
+/* Pick the active cell definition — user override if present, else preset. */
+static const SplitCell* resolve_cell(int idx) {
+    if (idx < 0 || idx >= MAX_SPLIT_CELLS) return NULL;
+    if (g_app.customCells[idx].w > 0) return &g_app.customCells[idx];
+    if (g_app.splitLayout < 0 || g_app.splitLayout >= PRESET_COUNT) return NULL;
+    const SplitPreset* p = &kPresets[g_app.splitLayout];
+    if (idx >= p->cellCount) return NULL;
+    return &p->cells[idx];
+}
+
 /* Resolve a SplitCell (percent coords) against a pixel rect. We round in a
  * way that the rightmost / bottommost cell always reaches the edge of the
  * workspace, avoiding 1px gaps. */
@@ -4394,15 +4463,42 @@ static RECT split_cell_rect(const RECT* parent, const SplitCell* c) {
 }
 
 static void draw_terminal(HDC dc, const RECT* rc) {
+    /* Invalidate zoom button rects so stale clicks don't fire after a layout
+     * change. They'll be repopulated by draw_terminal_header below.       */
+    for (int i = 0; i < MAX_SPLIT_CELLS; ++i)
+        SetRectEmpty(&g_app.zoomBtnRect[i]);
+
     if (g_app.splitLayout == PRESET_SINGLE) {
-        draw_terminal_cell(dc, rc, g_app.activeTab, TRUE);
+        draw_terminal_cell(dc, rc, g_app.activeTab, TRUE, -1);
         return;
     }
+
     const SplitPreset* preset = &kPresets[g_app.splitLayout];
+
+    /* ZOOM MODE: render only the zoomed cell at ~90% of the workspace,
+     * centered, with a thin dim border so the user knows it's modal.   */
+    if (g_app.zoomedCell >= 0 && g_app.zoomedCell < preset->cellCount) {
+        /* Dim background to hint that other cells are still alive */
+        fill_rect_color(dc, rc, RGB(0x0A, 0x0B, 0x12));
+        int W = rc->right - rc->left;
+        int H = rc->bottom - rc->top;
+        int pad = 5; /* 5% padding around → 90% effective */
+        RECT zr;
+        zr.left   = rc->left + (W * pad) / 100;
+        zr.top    = rc->top  + (H * pad) / 100;
+        zr.right  = rc->right - (W * pad) / 100;
+        zr.bottom = rc->bottom - (H * pad) / 100;
+        int tabIdx = g_app.splitSlots[g_app.zoomedCell];
+        draw_terminal_cell(dc, &zr, tabIdx, TRUE, g_app.zoomedCell);
+        return;
+    }
+
     for (int i = 0; i < preset->cellCount; ++i) {
-        RECT cellRc = split_cell_rect(rc, &preset->cells[i]);
+        const SplitCell* c = resolve_cell(i);
+        if (!c) continue;
+        RECT cellRc = split_cell_rect(rc, c);
         int tabIdx = g_app.splitSlots[i];
-        draw_terminal_cell(dc, &cellRc, tabIdx, i == g_app.splitActiveCell);
+        draw_terminal_cell(dc, &cellRc, tabIdx, i == g_app.splitActiveCell, i);
     }
 }
 
@@ -4530,6 +4626,269 @@ static int hit_test_stats_chip(int x, int y, const RECT* rc) {
     if (y < rc->top + 7 || y >= rc->bottom - 7) return 0;
     if (x < rc->right - 150 || x >= rc->right - 10) return 0;
     return 1;
+}
+
+/* Returns cell index (0..MAX_SPLIT_CELLS-1) whose zoom button was clicked,
+ * or -1 if none. Rects are populated by draw_terminal_header.            */
+static int hit_test_zoom_btn(int x, int y) {
+    for (int i = 0; i < MAX_SPLIT_CELLS; ++i) {
+        RECT r = g_app.zoomBtnRect[i];
+        if (r.right == r.left || r.bottom == r.top) continue;   /* empty */
+        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return i;
+    }
+    return -1;
+}
+
+static void toggle_zoom(int cellIdx) {
+    if (g_app.splitLayout == PRESET_SINGLE) return;
+    if (cellIdx < 0) cellIdx = g_app.splitActiveCell;
+    if (g_app.zoomedCell == cellIdx) g_app.zoomedCell = -1;     /* same → off */
+    else                              g_app.zoomedCell = cellIdx; /* others → switch */
+    InvalidateRect(g_app.hWnd, NULL, FALSE);
+}
+
+static int hit_test_size_btn(int x, int y) {
+    for (int i = 0; i < MAX_SPLIT_CELLS; ++i) {
+        RECT r = g_app.sizeBtnRect[i];
+        if (r.right == r.left || r.bottom == r.top) continue;
+        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return i;
+    }
+    return -1;
+}
+
+/* ---- Resize popup --------------------------------------------------- */
+#define RESIZE_W 320
+#define RESIZE_H 340
+
+typedef struct {
+    int cellIdx;
+    HWND hWnd;
+    int hoverIdx;     /* 0=up, 1=down, 2=left, 3=right, 4=shrinkU, 5=shrinkD, 6=shrinkL, 7=shrinkR, 8=reset */
+} ResizeCtx;
+
+static ResizeCtx* g_resizeCtx = NULL;
+
+static const int RESIZE_DELTA = 10;   /* percent points per click */
+
+static void resize_apply(int cellIdx, int dxL, int dyT, int dxR, int dyB) {
+    if (cellIdx < 0 || cellIdx >= MAX_SPLIT_CELLS) return;
+    const SplitCell* base = resolve_cell(cellIdx);
+    if (!base) return;
+    SplitCell c = *base;
+    c.x = (short)clamp_int(c.x + dxL, 0, 90);
+    c.y = (short)clamp_int(c.y + dyT, 0, 90);
+    c.w = (short)clamp_int(c.w - dxL + dxR, 10, 100);
+    c.h = (short)clamp_int(c.h - dyT + dyB, 10, 100);
+    if (c.x + c.w > 100) c.w = 100 - c.x;
+    if (c.y + c.h > 100) c.h = 100 - c.y;
+    g_app.customCells[cellIdx] = c;
+    InvalidateRect(g_app.hWnd, NULL, FALSE);
+}
+
+static void resize_reset(int cellIdx) {
+    if (cellIdx < 0 || cellIdx >= MAX_SPLIT_CELLS) return;
+    memset(&g_app.customCells[cellIdx], 0, sizeof(SplitCell));
+    InvalidateRect(g_app.hWnd, NULL, FALSE);
+}
+
+static RECT resize_btn_rect(int slot) {
+    /* Grid:
+     *        [ ^ ]         (0)
+     *  [ ← ] [ size ] [ → ]  (2)(label)(3)
+     *        [ v ]         (1)
+     *
+     *        [ v ]         (5 shrink down)
+     *  [ → ] [ size ] [ ← ]  (6)(label)(7)
+     *        [ ^ ]         (4 shrink up)
+     *
+     *        [ Voltar ao preset ]  (8) */
+    RECT r = {0, 0, 56, 36};
+    int cx = RESIZE_W / 2;
+    switch (slot) {
+        case 0: r.left = cx - 28;  r.top =  72; break;   /* expand up */
+        case 1: r.left = cx - 28;  r.top = 152; break;   /* expand down */
+        case 2: r.left = cx - 92;  r.top = 112; break;   /* expand left */
+        case 3: r.left = cx + 36;  r.top = 112; break;   /* expand right */
+        case 4: r.left = cx - 28;  r.top = 222; break;   /* shrink up */
+        case 5: r.left = cx - 28;  r.top = 252; break;   /* shrink down */
+        case 6: r.left = cx - 92;  r.top = 237; break;   /* shrink left */
+        case 7: r.left = cx + 36;  r.top = 237; break;   /* shrink right */
+        case 8: r.left = 20;       r.top = RESIZE_H - 44; r.right = RESIZE_W - 20; r.bottom = r.top + 32; return r;
+        default: break;
+    }
+    r.right  = r.left + 56;
+    r.bottom = r.top  + 36;
+    return r;
+}
+
+static int resize_hit_test(int x, int y) {
+    for (int i = 0; i < 9; ++i) {
+        RECT r = resize_btn_rect(i);
+        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return i;
+    }
+    return -1;
+}
+
+static void resize_paint(HDC dc, RECT cli) {
+    fill_rect_color(dc, &cli, COL_BG_SIDE);
+    draw_text_w(dc, 20, 16, L"Tamanho desta célula", COL_FG, g_app.hFontUIBold);
+
+    const SplitCell* c = resolve_cell(g_resizeCtx->cellIdx);
+    if (c) {
+        wchar_t info[64];
+        _snwprintf_s(info, 64, _TRUNCATE, L"%d×%d %% da área",
+                     c->w, c->h);
+        SIZE sz;
+        HFONT old = (HFONT)SelectObject(dc, g_app.hFontUI);
+        GetTextExtentPoint32W(dc, info, (int)wcslen(info), &sz);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, COL_ACCENT);
+        TextOutW(dc, RESIZE_W - sz.cx - 20, 18, info, (int)wcslen(info));
+        SelectObject(dc, old);
+    }
+
+    draw_text_w(dc, 20, 44, L"Expandir", COL_GREEN, g_app.hFontUIBold);
+    draw_text_w(dc, 20, 200, L"Reduzir", COL_ORANGE, g_app.hFontUIBold);
+
+    /* Draw buttons 0..7 */
+    static const wchar_t* labels[8] = {
+        L"↑", L"↓", L"←", L"→",
+        L"↑", L"↓", L"←", L"→"
+    };
+    for (int i = 0; i < 8; ++i) {
+        RECT r = resize_btn_rect(i);
+        BOOL hover = (g_resizeCtx->hoverIdx == i);
+        COLORREF bg = hover ? COL_BG_CHIP_H : COL_BG_CHIP;
+        COLORREF bd = (i < 4) ? COL_GREEN : COL_ORANGE;
+        draw_rounded_rect(dc, r, bg, mix_color(bd, RGB(0,0,0), 0.5), 8);
+        SIZE sz;
+        HFONT old = (HFONT)SelectObject(dc, g_app.hFontBig);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, bd);
+        GetTextExtentPoint32W(dc, labels[i], 1, &sz);
+        TextOutW(dc, r.left + ((r.right - r.left) - sz.cx) / 2,
+                 r.top  + ((r.bottom - r.top) - sz.cy) / 2 - 2,
+                 labels[i], 1);
+        SelectObject(dc, old);
+    }
+
+    /* Reset button */
+    RECT reset = resize_btn_rect(8);
+    BOOL hover = (g_resizeCtx->hoverIdx == 8);
+    draw_rounded_rect(dc, reset, hover ? COL_BG_CHIP_H : COL_BG_CHIP,
+                      COL_RED, 8);
+    SIZE rsz;
+    HFONT old = (HFONT)SelectObject(dc, g_app.hFontUI);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, COL_RED);
+    const wchar_t* rl = L"Voltar ao preset";
+    GetTextExtentPoint32W(dc, rl, (int)wcslen(rl), &rsz);
+    TextOutW(dc, reset.left + ((reset.right - reset.left) - rsz.cx) / 2,
+             reset.top  + ((reset.bottom - reset.top) - rsz.cy) / 2,
+             rl, (int)wcslen(rl));
+    SelectObject(dc, old);
+}
+
+static void resize_action(int slot) {
+    int idx = g_resizeCtx->cellIdx;
+    switch (slot) {
+        /* Expand */
+        case 0: resize_apply(idx, 0, -RESIZE_DELTA, 0, 0); break;        /* up */
+        case 1: resize_apply(idx, 0, 0, 0, RESIZE_DELTA); break;         /* down */
+        case 2: resize_apply(idx, -RESIZE_DELTA, 0, 0, 0); break;        /* left */
+        case 3: resize_apply(idx, 0, 0, RESIZE_DELTA, 0); break;         /* right */
+        /* Shrink */
+        case 4: resize_apply(idx, 0, RESIZE_DELTA, 0, 0); break;         /* shrink up = move top down */
+        case 5: resize_apply(idx, 0, 0, 0, -RESIZE_DELTA); break;        /* shrink down */
+        case 6: resize_apply(idx, RESIZE_DELTA, 0, 0, 0); break;         /* shrink left */
+        case 7: resize_apply(idx, 0, 0, -RESIZE_DELTA, 0); break;        /* shrink right */
+        case 8: resize_reset(idx); break;
+    }
+}
+
+static LRESULT CALLBACK ResizeWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_ERASEBKGND: return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(hWnd, &ps);
+            RECT cli; GetClientRect(hWnd, &cli);
+            HDC mem = CreateCompatibleDC(dc);
+            HBITMAP bmp = CreateCompatibleBitmap(dc, cli.right, cli.bottom);
+            HBITMAP oldBmp = (HBITMAP)SelectObject(mem, bmp);
+            resize_paint(mem, cli);
+            BitBlt(dc, 0, 0, cli.right, cli.bottom, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, oldBmp);
+            DeleteObject(bmp);
+            DeleteDC(mem);
+            EndPaint(hWnd, &ps);
+            return 0;
+        }
+        case WM_MOUSEMOVE: {
+            int x = LOWORD(lParam), y = HIWORD(lParam);
+            int h = resize_hit_test(x, y);
+            if (h != g_resizeCtx->hoverIdx) {
+                g_resizeCtx->hoverIdx = h;
+                InvalidateRect(hWnd, NULL, FALSE);
+            }
+            return 0;
+        }
+        case WM_LBUTTONDOWN: {
+            int x = LOWORD(lParam), y = HIWORD(lParam);
+            int h = resize_hit_test(x, y);
+            if (h >= 0) resize_action(h);
+            return 0;
+        }
+        case WM_ACTIVATE:
+            if (LOWORD(wParam) == WA_INACTIVE) DestroyWindow(hWnd);
+            return 0;
+        case WM_KEYDOWN:
+            if (wParam == VK_ESCAPE) DestroyWindow(hWnd);
+            return 0;
+        case WM_DESTROY:
+            g_resizeCtx = NULL;
+            return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+static void show_resize_popup(int cellIdx, int screenX, int screenY) {
+    if (g_resizeCtx) { DestroyWindow(g_resizeCtx->hWnd); return; }
+
+    static BOOL registered = FALSE;
+    if (!registered) {
+        WNDCLASSEXW wc = { sizeof(wc) };
+        wc.lpfnWndProc = ResizeWndProc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.hCursor = LoadCursorW(NULL, IDC_HAND);
+        wc.hbrBackground = NULL;
+        wc.lpszClassName = L"DanteResizePopup";
+        RegisterClassExW(&wc);
+        registered = TRUE;
+    }
+
+    static ResizeCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.cellIdx = cellIdx;
+    ctx.hoverIdx = -1;
+    g_resizeCtx = &ctx;
+
+    int sw = GetSystemMetrics(SM_CXSCREEN);
+    int sh = GetSystemMetrics(SM_CYSCREEN);
+    int x = screenX - RESIZE_W + 30;
+    int y = screenY + 8;
+    if (x < 8) x = 8;
+    if (x + RESIZE_W > sw - 8) x = sw - RESIZE_W - 8;
+    if (y + RESIZE_H > sh - 8) y = screenY - RESIZE_H - 8;
+
+    ctx.hWnd = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+        L"DanteResizePopup", L"Tamanho da célula",
+        WS_POPUP | WS_BORDER,
+        x, y, RESIZE_W, RESIZE_H,
+        g_app.hWnd, NULL, GetModuleHandleW(NULL), NULL);
+    ShowWindow(ctx.hWnd, SW_SHOW);
+    SetForegroundWindow(ctx.hWnd);
 }
 
 static int hit_test_sidebar_mode(int x, int y, const RECT* rc) {
@@ -4760,6 +5119,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             for (int i = 0; i < MAX_SPLIT_CELLS; ++i) g_app.splitSlots[i] = -1;
             g_app.splitLayout = PRESET_SINGLE;
             g_app.splitActiveCell = 0;
+            g_app.zoomedCell = -1;
 
             return 0;
         }
@@ -4828,6 +5188,22 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 update_status();
                 return 0;
             }
+            /* Zoom button on any cell header has top priority. */
+            {
+                int zc = hit_test_zoom_btn(x, y);
+                if (zc >= 0) { toggle_zoom(zc); return 0; }
+            }
+            /* Resize button anchors a popup window. */
+            {
+                int sc = hit_test_size_btn(x, y);
+                if (sc >= 0) {
+                    POINT pt = { x, y };
+                    ClientToScreen(hWnd, &pt);
+                    show_resize_popup(sc, pt.x, pt.y);
+                    return 0;
+                }
+            }
+
             if (hit_test_new_tab(x, y, &tabRc)) { open_new_tab(L"powershell"); return 0; }
             if (hit_test_stats_chip(x, y, &tabRc)) {
                 POINT screenPt = { x, tabRc.bottom };
@@ -4845,7 +5221,9 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 y >= termRc.top && y < termRc.bottom) {
                 const SplitPreset* preset = &kPresets[g_app.splitLayout];
                 for (int i = 0; i < preset->cellCount; ++i) {
-                    RECT cellRc = split_cell_rect(&termRc, &preset->cells[i]);
+                    const SplitCell* sc = resolve_cell(i);
+                    if (!sc) continue;
+                    RECT cellRc = split_cell_rect(&termRc, sc);
                     if (x >= cellRc.left && x < cellRc.right &&
                         y >= cellRc.top && y < cellRc.bottom) {
                         g_app.splitActiveCell = i;
@@ -4937,6 +5315,13 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (ctrl && wParam == VK_OEM_COMMA) { show_settings_dialog(); return 0; }  /* Ctrl+, */
             if (wParam == VK_F1) { show_about(); return 0; }
             if (ctrl && wParam == 'D' && !shift) { duplicate_tab(g_app.activeTab); return 0; }
+            if (ctrl && shift && wParam == 'Z') { toggle_zoom(g_app.splitActiveCell); return 0; }
+            /* Esc closes zoom if zoom is active (and cheatsheet isn't). */
+            if (wParam == VK_ESCAPE && g_app.zoomedCell >= 0 && !g_app.cheatsheetVisible) {
+                g_app.zoomedCell = -1;
+                InvalidateRect(hWnd, NULL, FALSE);
+                return 0;
+            }
             if (g_app.cheatsheetVisible && wParam == VK_ESCAPE) { cheatsheet_toggle(); return 0; }
             if (ctrl && wParam == 'T' && !shift) { open_new_tab(L"powershell"); return 0; }
             if (ctrl && wParam == 'W' && !shift) {

@@ -27,7 +27,7 @@ Projeto C++20/Qt 6 completo, dividido em **5 bibliotecas + 1 executável**:
 
 - `installer/inno/dante-cli.iss` — Inno Setup 6, com licença pt-BR/EN, PATH opcional
 - `installer/nsis/dante-cli.nsi` — NSIS 3, com seleção de componentes, atalhos, Add/Remove Programs
-- `dist/installer/DanteCLI-Setup-1.0.20-x64.exe` — **stub real** (PE32 self-extracting, 79 KB) — comprovação de que a sintaxe NSIS está válida
+- `dist/installer/DanteCLI-Setup-1.0.22-x64.exe` — **stub real** (PE32 self-extracting, 79 KB) — comprovação de que a sintaxe NSIS está válida
 
 ### Documentação
 
@@ -73,7 +73,7 @@ Projeto C++20/Qt 6 completo, dividido em **5 bibliotecas + 1 executável**:
 git clone <repo> DANTE-CLI-WIN
 cd DANTE-CLI-WIN
 .\scripts\make-installer.ps1
-# Pega dist\installer\DanteCLI-Setup-1.0.20-x64.exe e executa
+# Pega dist\installer\DanteCLI-Setup-1.0.22-x64.exe e executa
 ```
 
 Pré-requisitos: Visual Studio 2022 Build Tools + Qt 6.5+ (msvc2022_64) + Inno Setup ou NSIS.
@@ -90,7 +90,7 @@ Pré-requisitos: Visual Studio 2022 Build Tools + Qt 6.5+ (msvc2022_64) + Inno S
 
 ## Não compilável neste ambiente (macOS)
 
-Este Mac não possui MSVC nem Qt 6 prebuilt para Windows. O instalador `DanteCLI-Setup-1.0.20-x64.exe` em `dist/installer/` é um **stub PE32 válido** gerado por `makensis` para validar a sintaxe — quando o build for executado em um Windows com Qt 6 instalado (via `scripts\make-installer.ps1`), o NSIS empacotará todos os DLLs e o `Dante CLI.exe` real dentro do mesmo `.nsi`, produzindo o instalador final de ~50-70 MB.
+Este Mac não possui MSVC nem Qt 6 prebuilt para Windows. O instalador `DanteCLI-Setup-1.0.22-x64.exe` em `dist/installer/` é um **stub PE32 válido** gerado por `makensis` para validar a sintaxe — quando o build for executado em um Windows com Qt 6 instalado (via `scripts\make-installer.ps1`), o NSIS empacotará todos os DLLs e o `Dante CLI.exe` real dentro do mesmo `.nsi`, produzindo o instalador final de ~50-70 MB.
 
 O caminho mais rápido para um instalador final pronto:
 1. Subir o repo no GitHub

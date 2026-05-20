@@ -3,6 +3,28 @@
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 Versionamento [SemVer](https://semver.org/lang/pt-BR/).
 
+## [1.0.22] — 2026-05-20
+
+### Adicionado
+- **Botão ⇲ no header de cada célula** (split mode) abre popup pra redimensionar a célula.
+- **Popup "Tamanho desta célula"**:
+  - Mostra dimensão atual em "% da área" (ex: `60×100 %`).
+  - **4 setas pra Expandir** (verde): ↑ ↓ ← → — cada click aumenta 10 pp.
+  - **4 setas pra Reduzir** (laranja): ↑ ↓ ← → — diminui 10 pp.
+  - **"Voltar ao preset"** (vermelho) zera a customização — célula volta exato ao preset original.
+  - Click fora ou Esc fecha.
+- `g_app.customCells[]` armazena overrides por célula (zerados quando layout muda). `resolve_cell()` retorna custom se setado, senão o preset.
+
+## [1.0.21] — 2026-05-20
+
+### Adicionado
+- **Zoom 90%** da célula ativa em modo split:
+  - Botão **⤢** (ou **⤡** quando ativo) no canto direito do header de cada célula, ao lado do chip de RAM.
+  - **Ctrl+Shift+Z** ativa/desativa zoom da célula ativa.
+  - Quando zoom está ativo, só a célula selecionada é renderizada, ocupando 90% da área do terminal (5 % de padding em torno), com fundo dim atrás. As outras células continuam vivas no background — sessions não são reiniciados.
+  - **Esc** sai do zoom.
+  - Mudar de layout via `▦ Layout` zera o zoom automaticamente (evita zoom em célula que sumiu).
+
 ## [1.0.20] — 2026-05-20
 
 ### Adicionado
