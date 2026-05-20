@@ -72,7 +72,7 @@ static PFN_ClosePseudoConsole  pClosePseudoConsole  = NULL;
  *                              CONSTANTS
  * ========================================================================= */
 
-#define APP_VERSION_W   L"1.0.19"
+#define APP_VERSION_W   L"1.0.20"
 #define APP_NAME_W      L"Dante CLI"
 #define APP_WINDOW_CLS  L"DanteCLIMainWindow"
 
@@ -572,6 +572,11 @@ static int  hit_test_sidebar_item(int x, int y, const RECT* sideRc);
 static int  hit_test_toolbar_action(int x, int y, const RECT* toolbarRc);
 static int  hit_test_tab_close(int x, int y, const RECT* tabBarRc, int tabIdx);
 static int  hit_test_new_tab(int x, int y, const RECT* tabBarRc);
+static int  hit_test_stats_chip(int x, int y, const RECT* tabBarRc);
+static void show_resource_monitor(int anchorX, int anchorY);
+static void resmon_sample(void);
+static COLORREF mix_color(COLORREF a, COLORREF b, double t);
+static COLORREF contrast_text_color(COLORREF c);
 static void update_status(void);
 static void persist_save(void);
 static void persist_load(void);
@@ -2173,6 +2178,400 @@ static void check_for_updates_async(void) {
 }
 
 /* =========================================================================
+ *                       RESOURCE MONITOR
+ *
+ * Per-PID CPU/Mem sampling + a 60-sample sparkline of total CPU. Click on
+ * the stats chip in the tab bar opens a non-modal popover that mirrors the
+ * macOS "Consumo de Recursos" panel.
+ * ========================================================================= */
+
+#define CPU_HIST_LEN     60
+#define MAX_TRACKED_PIDS 64
+
+typedef struct {
+    DWORD     pid;
+    ULONGLONG lastKernel;
+    ULONGLONG lastUser;
+    ULONGLONG lastWall;     /* GetTickCount64 */
+} CpuSample;
+
+static CpuSample g_cpuSamples[MAX_TRACKED_PIDS];
+
+static double    g_cpuHist[CPU_HIST_LEN];   /* total CPU% (0..100) history */
+static int       g_cpuHistIdx = 0;
+static double    g_lastTotalCpu = 0.0;
+static SIZE_T    g_lastTotalMem = 0;
+static SIZE_T    g_lastAppMem   = 0;
+static SIZE_T    g_lastShellMem = 0;
+static int       g_cpuCoreCount = 0;
+
+static CpuSample* cpu_sample_for(DWORD pid) {
+    CpuSample* free_slot = NULL;
+    for (int i = 0; i < MAX_TRACKED_PIDS; ++i) {
+        if (g_cpuSamples[i].pid == pid) return &g_cpuSamples[i];
+        if (!free_slot && g_cpuSamples[i].pid == 0) free_slot = &g_cpuSamples[i];
+    }
+    if (!free_slot) free_slot = &g_cpuSamples[0]; /* LRU-ish */
+    memset(free_slot, 0, sizeof(*free_slot));
+    free_slot->pid = pid;
+    return free_slot;
+}
+
+static double cpu_pct_for_pid(DWORD pid) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return 0.0;
+    FILETIME ct = {0}, et = {0}, kt = {0}, ut = {0};
+    if (!GetProcessTimes(h, &ct, &et, &kt, &ut)) { CloseHandle(h); return 0.0; }
+    CloseHandle(h);
+
+    ULARGE_INTEGER kli, uli;
+    kli.LowPart = kt.dwLowDateTime; kli.HighPart = kt.dwHighDateTime;
+    uli.LowPart = ut.dwLowDateTime; uli.HighPart = ut.dwHighDateTime;
+    ULONGLONG nowK  = kli.QuadPart;
+    ULONGLONG nowU  = uli.QuadPart;
+    ULONGLONG nowW  = GetTickCount64();
+
+    CpuSample* s = cpu_sample_for(pid);
+    double pct = 0.0;
+    if (s->lastWall != 0) {
+        ULONGLONG dCpu  = (nowK - s->lastKernel) + (nowU - s->lastUser);
+        ULONGLONG dTime = (nowW - s->lastWall) * 10000ULL;  /* ms → 100ns */
+        if (dTime > 0 && g_cpuCoreCount > 0) {
+            pct = (double)dCpu / (double)dTime /
+                  (double)g_cpuCoreCount * 100.0;
+            if (pct < 0.0) pct = 0.0;
+            if (pct > 100.0) pct = 100.0;
+        }
+    }
+    s->lastKernel = nowK; s->lastUser = nowU; s->lastWall = nowW;
+    return pct;
+}
+
+static SIZE_T mem_for_pid(DWORD pid) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+                           FALSE, pid);
+    if (!h) return 0;
+    PROCESS_MEMORY_COUNTERS_EX pmc = {0};
+    pmc.cb = sizeof(pmc);
+    SIZE_T out = 0;
+    if (GetProcessMemoryInfo(h, (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc)))
+        out = pmc.PrivateUsage;
+    CloseHandle(h);
+    return out;
+}
+
+/* Recompute everything once. Called every 1 s from the main timer. */
+static void resmon_sample(void) {
+    if (g_cpuCoreCount == 0) {
+        SYSTEM_INFO si; GetSystemInfo(&si);
+        g_cpuCoreCount = (int)si.dwNumberOfProcessors;
+        if (g_cpuCoreCount < 1) g_cpuCoreCount = 1;
+    }
+
+    /* App process */
+    DWORD appPid = GetCurrentProcessId();
+    double appCpu = cpu_pct_for_pid(appPid);
+    g_lastAppMem  = mem_for_pid(appPid);
+
+    /* Shells */
+    double shCpu = 0.0;
+    SIZE_T shMem = 0;
+    for (int i = 0; i < g_app.tabCount; ++i) {
+        Tab* t = g_app.tabs[i];
+        if (!t || !t->session || !t->session->pid) continue;
+        shCpu += cpu_pct_for_pid(t->session->pid);
+        shMem += mem_for_pid(t->session->pid);
+    }
+
+    g_lastTotalCpu  = appCpu + shCpu;
+    if (g_lastTotalCpu > 100.0) g_lastTotalCpu = 100.0;
+    g_lastShellMem  = shMem;
+    g_lastTotalMem  = g_lastAppMem + g_lastShellMem;
+
+    g_cpuHist[g_cpuHistIdx] = g_lastTotalCpu;
+    g_cpuHistIdx = (g_cpuHistIdx + 1) % CPU_HIST_LEN;
+}
+
+static void fmt_bytes(SIZE_T bytes, wchar_t* out, size_t cap) {
+    double v = (double)bytes;
+    if (v < 1024.0)                _snwprintf_s(out, cap, _TRUNCATE, L"%.0f B",  v);
+    else if (v < 1024.0 * 1024)    _snwprintf_s(out, cap, _TRUNCATE, L"%.0f KB", v / 1024.0);
+    else if (v < 1024.0 * 1024 * 1024) {
+        double mb = v / (1024.0 * 1024);
+        if (mb < 1000) _snwprintf_s(out, cap, _TRUNCATE, L"%.0f M",  mb);
+        else           _snwprintf_s(out, cap, _TRUNCATE, L"%.2f GB", mb / 1024.0);
+    } else {
+        _snwprintf_s(out, cap, _TRUNCATE, L"%.2f GB", v / (1024.0 * 1024 * 1024));
+    }
+}
+
+/* ---- Popover window -------------------------------------------------- */
+
+#define MON_W   540
+#define MON_H   720
+
+static HWND g_monitorHwnd = NULL;
+
+static void monitor_paint(HDC dc, RECT cli) {
+    /* Background */
+    HBRUSH bg = CreateSolidBrush(COL_BG_SIDE);
+    FillRect(dc, &cli, bg);
+    DeleteObject(bg);
+
+    int x = 22, y = 18;
+
+    /* Header */
+    draw_text_w(dc, x, y, L"\U0001F4CA  Consumo de Recursos",
+                COL_FG, g_app.hFontBig);
+    SIZE titleSz;
+    HFONT oldF = (HFONT)SelectObject(dc, g_app.hFontBig);
+    GetTextExtentPoint32W(dc, L"\U0001F4CA  Consumo de Recursos",
+                          22, &titleSz);
+    SelectObject(dc, oldF);
+    draw_text_w(dc, MON_W - 150, y + 8, L"Atualiza a cada 1s",
+                COL_FG_DIM, g_app.hFontUI);
+
+    y += titleSz.cy + 12;
+
+    HPEN pen = CreatePen(PS_SOLID, 1, COL_DIV);
+    HGDIOBJ op = SelectObject(dc, pen);
+    MoveToEx(dc, 16, y, NULL);
+    LineTo(dc, MON_W - 16, y);
+    SelectObject(dc, op);
+    DeleteObject(pen);
+
+    y += 18;
+
+    /* CPU */
+    draw_text_w(dc, x, y, L"⊙  CPU", COL_FG, g_app.hFontUIBold);
+    wchar_t cpuStr[32];
+    _snwprintf_s(cpuStr, 32, _TRUNCATE, L"%.1f%%", g_lastTotalCpu);
+    HFONT oldB = (HFONT)SelectObject(dc, g_app.hFontBig);
+    SIZE cpuSz;
+    GetTextExtentPoint32W(dc, cpuStr, (int)wcslen(cpuStr), &cpuSz);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, g_lastTotalCpu > 80 ? COL_RED
+                  : g_lastTotalCpu > 40 ? COL_ORANGE
+                  : COL_GREEN);
+    TextOutW(dc, MON_W - cpuSz.cx - 22, y - 4, cpuStr, (int)wcslen(cpuStr));
+    SelectObject(dc, oldB);
+    y += 26;
+
+    /* Sparkline */
+    RECT spark = { x, y, MON_W - 22, y + 70 };
+    fill_rect_color(dc, &spark, RGB(0x10, 0x10, 0x18));
+    HPEN linePen = CreatePen(PS_SOLID, 2, COL_GREEN);
+    HGDIOBJ olp = SelectObject(dc, linePen);
+    int sparkW = spark.right - spark.left;
+    int sparkH = spark.bottom - spark.top;
+    int prevX = -1, prevY = -1;
+    for (int i = 0; i < CPU_HIST_LEN; ++i) {
+        int slot = (g_cpuHistIdx + i) % CPU_HIST_LEN;
+        double v = g_cpuHist[slot] / 100.0;
+        int px = spark.left + (sparkW * i) / (CPU_HIST_LEN - 1);
+        int py = spark.bottom - (int)(sparkH * v) - 1;
+        if (prevX >= 0) {
+            MoveToEx(dc, prevX, prevY, NULL);
+            LineTo(dc, px, py);
+        }
+        prevX = px; prevY = py;
+    }
+    SelectObject(dc, olp);
+    DeleteObject(linePen);
+    y += 78;
+
+    draw_text_w(dc, x, y,
+                L"100% = 1 núcleo. Topo do gráfico = todos os núcleos saturados.",
+                COL_FG_DIM, g_app.hFontUI);
+    y += 26;
+
+    /* Memory */
+    draw_text_w(dc, x, y, L"\U0001F4BE  Memória", COL_FG, g_app.hFontUIBold);
+    wchar_t memStr[32];
+    fmt_bytes(g_lastTotalMem, memStr, 32);
+    oldB = (HFONT)SelectObject(dc, g_app.hFontBig);
+    SIZE memSz;
+    GetTextExtentPoint32W(dc, memStr, (int)wcslen(memStr), &memSz);
+    SetTextColor(dc, COL_RED);
+    TextOutW(dc, MON_W - memSz.cx - 22, y - 4, memStr, (int)wcslen(memStr));
+    SelectObject(dc, oldB);
+    y += 26;
+
+    /* Memory bar: App in blue, Shells in magenta */
+    RECT mbar = { x, y, MON_W - 22, y + 18 };
+    fill_rect_color(dc, &mbar, RGB(0x10, 0x10, 0x18));
+    if (g_lastTotalMem > 0) {
+        double appFrac   = (double)g_lastAppMem   / (double)g_lastTotalMem;
+        double shellFrac = (double)g_lastShellMem / (double)g_lastTotalMem;
+        int barW = mbar.right - mbar.left;
+        int appW   = (int)(barW * appFrac);
+        int shellW = (int)(barW * shellFrac);
+        RECT a = { mbar.left, mbar.top, mbar.left + appW, mbar.bottom };
+        RECT s = { a.right,    mbar.top, a.right + shellW, mbar.bottom };
+        fill_rect_color(dc, &a, COL_ACCENT);
+        fill_rect_color(dc, &s, COL_MAGENTA);
+    }
+    y += 26;
+
+    /* Legend */
+    wchar_t appLbl[32], shLbl[32];
+    fmt_bytes(g_lastAppMem,  appLbl, 32);
+    fmt_bytes(g_lastShellMem, shLbl, 32);
+    HBRUSH dotA = CreateSolidBrush(COL_ACCENT);
+    RECT da = { x, y + 5, x + 10, y + 15 };
+    FillRect(dc, &da, dotA);
+    DeleteObject(dotA);
+    wchar_t legA[64];
+    _snwprintf_s(legA, 64, _TRUNCATE, L"App  %s", appLbl);
+    draw_text_w(dc, x + 16, y + 2, legA, COL_FG, g_app.hFontUI);
+
+    HBRUSH dotS = CreateSolidBrush(COL_MAGENTA);
+    RECT ds = { x + 160, y + 5, x + 170, y + 15 };
+    FillRect(dc, &ds, dotS);
+    DeleteObject(dotS);
+    wchar_t legS[64];
+    _snwprintf_s(legS, 64, _TRUNCATE, L"Shells  %s", shLbl);
+    draw_text_w(dc, x + 176, y + 2, legS, COL_FG, g_app.hFontUI);
+    y += 28;
+
+    draw_text_w(dc, x, y,
+                L"App = processo Dante CLI. Shells = soma de cada terminal +",
+                COL_FG_DIM, g_app.hFontUI);
+    draw_text_w(dc, x, y + 16,
+                L"processos filhos (npm, node, git, etc.).",
+                COL_FG_DIM, g_app.hFontUI);
+    y += 38;
+
+    /* Divider */
+    HPEN p2 = CreatePen(PS_SOLID, 1, COL_DIV);
+    HGDIOBJ op2 = SelectObject(dc, p2);
+    MoveToEx(dc, 16, y, NULL);
+    LineTo(dc, MON_W - 16, y);
+    SelectObject(dc, op2);
+    DeleteObject(p2);
+    y += 18;
+
+    /* Tabs header */
+    draw_text_w(dc, x, y, L"\U0001F4BB  Terminais ativos",
+                COL_FG, g_app.hFontUIBold);
+    wchar_t cnt[32];
+    _snwprintf_s(cnt, 32, _TRUNCATE, L"%d shell(s)", g_app.tabCount);
+    SIZE cs;
+    HFONT oldU = (HFONT)SelectObject(dc, g_app.hFontUI);
+    GetTextExtentPoint32W(dc, cnt, (int)wcslen(cnt), &cs);
+    SetTextColor(dc, COL_FG_DIM);
+    TextOutW(dc, MON_W - cs.cx - 22, y + 2, cnt, (int)wcslen(cnt));
+    SelectObject(dc, oldU);
+    y += 26;
+
+    /* Tab cards — 2 columns */
+    int cardW = (MON_W - 22 - 22 - 12) / 2;
+    int cardH = 56;
+    for (int i = 0; i < g_app.tabCount && y + cardH < cli.bottom - 12; ++i) {
+        Tab* t = g_app.tabs[i];
+        if (!t) continue;
+        int col = i % 2;
+        int row = i / 2;
+        RECT card;
+        card.left  = x + col * (cardW + 12);
+        card.top   = y + row * (cardH + 8);
+        card.right = card.left + cardW;
+        card.bottom= card.top + cardH;
+        if (card.bottom >= cli.bottom - 8) break;
+
+        COLORREF acc = (t->colorIdx >= 0) ? kTabColors[t->colorIdx] : COL_ACCENT;
+        draw_rounded_rect(dc, card, COL_BG_CHIP, mix_color(acc, RGB(0,0,0), 0.40), 8);
+
+        if (t->emoji[0])
+            draw_text_w(dc, card.left + 10, card.top + 6,
+                        t->emoji, COL_FG, g_app.hFontEmoji);
+        wchar_t name[64];
+        size_t nl = wcslen(t->title);
+        if (nl > 18) { wcsncpy_s(name, 64, t->title, 17); name[17] = L'…'; name[18] = 0; }
+        else         wcscpy_s(name, 64, t->title);
+        draw_text_w(dc, card.left + 38, card.top + 6,
+                    name, COL_FG, g_app.hFontUIBold);
+
+        wchar_t info[64];
+        SIZE_T tmem = t->session ? mem_for_pid(t->session->pid) : 0;
+        double tcpu = t->session ? cpu_pct_for_pid(t->session->pid) : 0.0;
+        wchar_t memBuf[16];
+        fmt_bytes(tmem, memBuf, 16);
+        _snwprintf_s(info, 64, _TRUNCATE, L"%s  ·  %.0f%%", memBuf, tcpu);
+        draw_text_w(dc, card.left + 38, card.top + 28,
+                    info, COL_FG_DIM, g_app.hFontUI);
+    }
+}
+
+static LRESULT CALLBACK MonitorWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_ERASEBKGND: return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(hWnd, &ps);
+            RECT cli; GetClientRect(hWnd, &cli);
+            HDC mem = CreateCompatibleDC(dc);
+            HBITMAP bmp = CreateCompatibleBitmap(dc, cli.right, cli.bottom);
+            HBITMAP oldBmp = (HBITMAP)SelectObject(mem, bmp);
+            monitor_paint(mem, cli);
+            BitBlt(dc, 0, 0, cli.right, cli.bottom, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, oldBmp);
+            DeleteObject(bmp);
+            DeleteDC(mem);
+            EndPaint(hWnd, &ps);
+            return 0;
+        }
+        case WM_ACTIVATE:
+            if (LOWORD(wParam) == WA_INACTIVE) DestroyWindow(hWnd);
+            return 0;
+        case WM_KEYDOWN:
+            if (wParam == VK_ESCAPE) DestroyWindow(hWnd);
+            return 0;
+        case WM_DESTROY:
+            g_monitorHwnd = NULL;
+            return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+static void show_resource_monitor(int anchorX, int anchorY) {
+    if (g_monitorHwnd) {
+        DestroyWindow(g_monitorHwnd);
+        return;
+    }
+    static BOOL registered = FALSE;
+    if (!registered) {
+        WNDCLASSEXW wc = { sizeof(wc) };
+        wc.lpfnWndProc = MonitorWndProc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        wc.hbrBackground = NULL;
+        wc.lpszClassName = L"DanteResourceMonitor";
+        RegisterClassExW(&wc);
+        registered = TRUE;
+    }
+    resmon_sample();
+
+    /* Anchor below the chip; flip if overflowing the screen. */
+    int sw = GetSystemMetrics(SM_CXSCREEN);
+    int sh = GetSystemMetrics(SM_CYSCREEN);
+    int x = anchorX - MON_W + 20;
+    int y = anchorY + 8;
+    if (x < 8) x = 8;
+    if (x + MON_W > sw - 8) x = sw - MON_W - 8;
+    if (y + MON_H > sh - 8) y = anchorY - MON_H - 8;
+
+    g_monitorHwnd = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+        L"DanteResourceMonitor", L"Consumo de Recursos",
+        WS_POPUP | WS_BORDER,
+        x, y, MON_W, MON_H,
+        g_app.hWnd, NULL, GetModuleHandleW(NULL), NULL);
+    ShowWindow(g_monitorHwnd, SW_SHOW);
+    SetForegroundWindow(g_monitorHwnd);
+}
+
+/* =========================================================================
  *                       SPLIT WORKSPACE
  * ========================================================================= */
 
@@ -3685,6 +4084,27 @@ static void draw_tabbar(HDC dc, const RECT* rc) {
     SetTextColor(dc, COL_ACCENT);
     DrawTextW(dc, L"+", -1, &plus, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     SelectObject(dc, old);
+
+    /* Stats chip on the right edge */
+    wchar_t memBuf[16], cpuBuf[16];
+    fmt_bytes(g_lastTotalMem, memBuf, 16);
+    _snwprintf_s(cpuBuf, 16, _TRUNCATE, L"%.0f%%", g_lastTotalCpu);
+    wchar_t combined[64];
+    _snwprintf_s(combined, 64, _TRUNCATE, L"\U0001F4CA  %s  ·  %s",
+                 memBuf, cpuBuf);
+    SIZE chipSz;
+    HFONT oldF = (HFONT)SelectObject(dc, g_app.hFontUI);
+    GetTextExtentPoint32W(dc, combined, (int)wcslen(combined), &chipSz);
+    SelectObject(dc, oldF);
+    int chipW = chipSz.cx + 24;
+    RECT chip = { rc->right - chipW - 10, rc->top + 7,
+                  rc->right - 10,          rc->bottom - 7 };
+    COLORREF cpuColor = g_lastTotalCpu > 80 ? COL_RED
+                      : g_lastTotalCpu > 40 ? COL_ORANGE
+                      : COL_GREEN;
+    draw_rounded_rect(dc, chip, COL_BG_CHIP, cpuColor, 12);
+    draw_text_w(dc, chip.left + 12, chip.top + 8, combined,
+                COL_FG, g_app.hFontUI);
 }
 
 /* ---------- Terminal ---------- */
@@ -4103,6 +4523,15 @@ static int hit_test_new_tab(int x, int y, const RECT* rc) {
     return (x >= px && x < px + 32 && y >= rc->top + 7 && y < rc->bottom - 7);
 }
 
+/* Stats chip lives on the right edge of the tab bar; recomputed every paint
+ * so any width difference is absorbed naturally. We approximate the rect
+ * here by reserving 140 px from the right.                              */
+static int hit_test_stats_chip(int x, int y, const RECT* rc) {
+    if (y < rc->top + 7 || y >= rc->bottom - 7) return 0;
+    if (x < rc->right - 150 || x >= rc->right - 10) return 0;
+    return 1;
+}
+
 static int hit_test_sidebar_mode(int x, int y, const RECT* rc) {
     for (int i = 0; i < MODE_COUNT; ++i) {
         RECT br; sidebar_mode_button_rect(i, rc, &br);
@@ -4400,6 +4829,12 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 return 0;
             }
             if (hit_test_new_tab(x, y, &tabRc)) { open_new_tab(L"powershell"); return 0; }
+            if (hit_test_stats_chip(x, y, &tabRc)) {
+                POINT screenPt = { x, tabRc.bottom };
+                ClientToScreen(hWnd, &screenPt);
+                show_resource_monitor(screenPt.x, screenPt.y);
+                return 0;
+            }
 
             int act = hit_test_toolbar_action(x, y, &toolbarRc);
             if (act >= 0) { perform_toolbar_action(act); return 0; }
@@ -4546,6 +4981,11 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case WM_TIMER:
             if (wParam == 1) {
+                resmon_sample();
+                /* While the monitor popover is open, force it to refresh too. */
+                if (g_monitorHwnd) InvalidateRect(g_monitorHwnd, NULL, FALSE);
+                /* Also redraw the main window so the chip + headers update. */
+                InvalidateRect(hWnd, NULL, FALSE);
                 update_status();
                 /* While recording, the REC mm:ss label must tick visibly.
                  * Without this the toolbar button stayed at "REC 00:00"

@@ -3,6 +3,24 @@
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 Versionamento [SemVer](https://semver.org/lang/pt-BR/).
 
+## [1.0.20] — 2026-05-20
+
+### Adicionado
+- **Monitor de Recursos** — popover não-modal igual ao do macOS.
+  - **Chip clicável** no canto direito da TabBar mostrando `📊 [Mem] · [CPU%]`. A borda do chip muda de cor: verde até 40%, laranja até 80%, vermelho acima.
+  - Click no chip abre popover de 540×720 com:
+    - **CPU total** (App + soma das shells) em destaque grande, colorido por nível.
+    - **Sparkline** de 60 amostras (1 amostra/s) do CPU% histórico — linha verde sobre canvas dark.
+    - **Memória total** (`PrivateUsage` somado).
+    - **Barra App vs Shells** com duas cores (azul = app, magenta = shells), proporcional ao uso real.
+    - **Legenda** com bytes humanizados (`M`, `GB`).
+    - **Grid de cards 2 colunas** com cada shell ativo: emoji, nome (com `…` se longo), `mem · cpu%`.
+  - Click fora / Esc / outro chip click fecha.
+  - Auto-refresh a cada 1 s (mesmo timer que faz o relógio do REC).
+- Computação `cpu_pct_for_pid` via `GetProcessTimes` com cache LRU por PID + normalização por número de cores.
+- `mem_for_pid` via `GetProcessMemoryInfo` (`PrivateUsage`).
+- Função `fmt_bytes` humaniza B/KB/M/GB automaticamente.
+
 ## [1.0.19] — 2026-05-20
 
 ### Adicionado
