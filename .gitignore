@@ -1,0 +1,45 @@
+# Build outputs
+build/
+out/
+dist/
+cmake-build-*/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+CMakeUserPresets.json
+
+# Qt
+*.qmake.cache
+*.qmake.stash
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+ui_*.h
+*.pro.user*
+
+# Compiled
+*.obj
+*.o
+*.lib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+!resources/icons/*.ico
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Translation binaries (regenerated)
+*.qm
+
+# Local config
+.env
+.env.local
+config.local.json

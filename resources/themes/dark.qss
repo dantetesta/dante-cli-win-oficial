@@ -1,0 +1,113 @@
+/* Dante CLI — dark global stylesheet */
+
+QMainWindow, QWidget {
+    background-color: #1A1B26;
+    color: #C0CAF5;
+    font-family: "Segoe UI", "Cascadia Code", sans-serif;
+    font-size: 13px;
+}
+
+QDockWidget {
+    titlebar-close-icon: url();
+    titlebar-normal-icon: url();
+}
+
+QDockWidget::title {
+    background: #16161E;
+    padding: 6px 10px;
+    text-align: left;
+    border-bottom: 1px solid #292E42;
+    font-weight: 600;
+    color: #C0CAF5;
+}
+
+QTabBar::tab {
+    background: #1F2335;
+    color: #A9B1D6;
+    padding: 6px 14px;
+    border: none;
+    border-radius: 4px;
+    margin-right: 2px;
+}
+
+QTabBar::tab:selected {
+    background: #7AA2F7;
+    color: #1A1B26;
+    font-weight: 600;
+}
+
+QTabWidget::pane {
+    border: none;
+    background: #1A1B26;
+}
+
+QListWidget, QTreeView {
+    background: #1F2335;
+    border: none;
+    border-radius: 6px;
+    padding: 4px;
+}
+
+QListWidget::item, QTreeView::item {
+    padding: 4px 6px;
+    border-radius: 4px;
+}
+
+QListWidget::item:selected, QTreeView::item:selected {
+    background: #7AA2F7;
+    color: #1A1B26;
+}
+
+QLineEdit {
+    background: #1F2335;
+    border: 1px solid #292E42;
+    border-radius: 6px;
+    padding: 6px 8px;
+    color: #C0CAF5;
+}
+
+QLineEdit:focus {
+    border-color: #7AA2F7;
+}
+
+QPushButton {
+    background: #24283B;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 14px;
+    color: #C0CAF5;
+}
+
+QPushButton:hover { background: #2F3549; }
+QPushButton:pressed { background: #7AA2F7; color: #1A1B26; }
+
+QToolBar {
+    background: #16161E;
+    border: none;
+    spacing: 4px;
+    padding: 4px 8px;
+}
+
+QToolButton {
+    background: transparent;
+    border: none;
+    padding: 6px 10px;
+    color: #C0CAF5;
+    border-radius: 6px;
+}
+
+QToolButton:hover { background: #24283B; }
+
+QStatusBar {
+    background: #16161E;
+    color: #565F89;
+    border-top: 1px solid #292E42;
+}
+
+QComboBox, QSpinBox, QFontComboBox {
+    background: #1F2335;
+    border: 1px solid #292E42;
+    border-radius: 6px;
+    padding: 4px 8px;
+    color: #C0CAF5;
+}

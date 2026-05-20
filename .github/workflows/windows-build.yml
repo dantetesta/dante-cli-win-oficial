@@ -1,0 +1,92 @@
+name: Windows Build & Installer
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Qt 6.8
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.1'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: 'qtmultimedia'
+          cache: true
+
+      - name: Install Ninja
+        run: choco install ninja -y
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          cmake -S . -B build/Release `
+            -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_PREFIX_PATH=$env:Qt6_DIR
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build/Release --config Release --parallel
+
+      - name: windeployqt
+        shell: pwsh
+        run: |
+          $exe = "build\Release\bin\Dante CLI.exe"
+          & "$env:Qt6_DIR\bin\windeployqt.exe" --release --no-translations --compiler-runtime "$exe"
+
+      - name: Stage dist
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/Release | Out-Null
+          Copy-Item -Recurse -Force "build/Release/bin/*" "dist/Release/"
+
+      - name: Setup NSIS
+        run: choco install nsis -y
+
+      - name: Build NSIS installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/installer | Out-Null
+          $nsis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          if (-not (Test-Path $nsis)) { $nsis = "$env:ProgramFiles\NSIS\makensis.exe" }
+          & $nsis /DDIST_DIR="../../dist/Release" /DOUT_DIR="../../dist/installer" installer/nsis/dante-cli.nsi
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: DanteCLI-Installer-Windows-x64
+          path: dist/installer/*.exe
+          if-no-files-found: error
+
+      - name: Upload portable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: DanteCLI-Portable-Windows-x64
+          path: dist/Release/
+          if-no-files-found: error
+
+      - name: Release on tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/installer/*.exe
+          draft: false
+          prerelease: false

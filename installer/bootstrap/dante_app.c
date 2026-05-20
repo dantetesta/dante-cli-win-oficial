@@ -1,0 +1,4115 @@
+/*
+ * Dante CLI — Win32 native clone of the SwiftUI macOS app.
+ *
+ * Single-file C application. No Qt, no external libraries — pure Win32 +
+ * GDI + ConPTY. Cross-compiles with mingw-w64 from macOS or builds with
+ * MSVC on Windows.
+ *
+ * Layout (matches the SwiftUI version):
+ *
+ *   +-----------------------------------------------------------+
+ *   | Sidebar |   TabBar      [+]    AI launchers       Stats   |  toolbar row
+ *   |   ★ 📁  +---------------------------------------+
+ *   |   ⚡ 🔑 |                                       |
+ *   |--------|                                       |
+ *   |Search… |    Terminal area (ConPTY pipe         |
+ *   |        |    rendered into a cell grid with GDI)|
+ *   | Items… |                                       |
+ *   |        |                                       |
+ *   +-----------------------------------------------------------+
+ *   | Dante CLI 1.0.x · PowerShell · session 1 · cwd ~          |  status bar
+ *   +-----------------------------------------------------------+
+ *
+ * Build:
+ *   x86_64-w64-mingw32-windres dante_cli_bootstrap.rc -O coff -o res.o
+ *   x86_64-w64-mingw32-gcc -O2 -s -municode -mwindows \
+ *       -DUNICODE -D_UNICODE -Wall -Wextra \
+ *       -o "Dante CLI.exe" dante_app.c res.o \
+ *       -static -static-libgcc \
+ *       -lcomctl32 -lshell32 -luser32 -lgdi32 -lkernel32 -lpsapi
+ */
+
+#define WIN32_LEAN_AND_MEAN
+#define UNICODE
+#define _UNICODE
+#define _WIN32_WINNT 0x0A00
+#include <windows.h>
+#include <shellapi.h>
+#include <commctrl.h>
+#include <commdlg.h>
+#include <shlobj.h>
+#include <psapi.h>
+#include <winhttp.h>
+#include <mmsystem.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <wchar.h>
+
+/* ConPTY APIs were added in Windows 10 1809 (build 17763). Some older mingw
+ * headers don't declare them — provide local prototypes when missing.    */
+#ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
+#define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE 0x00020016
+#endif
+
+#ifndef IDC_STATIC
+#define IDC_STATIC ((int)-1)
+#endif
+
+#define UNUSED(x) ((void)(x))
+
+typedef VOID* HPCON;
+typedef HRESULT (WINAPI *PFN_CreatePseudoConsole)(COORD, HANDLE, HANDLE, DWORD, HPCON*);
+typedef HRESULT (WINAPI *PFN_ResizePseudoConsole)(HPCON, COORD);
+typedef VOID    (WINAPI *PFN_ClosePseudoConsole)(HPCON);
+
+static PFN_CreatePseudoConsole pCreatePseudoConsole = NULL;
+static PFN_ResizePseudoConsole pResizePseudoConsole = NULL;
+static PFN_ClosePseudoConsole  pClosePseudoConsole  = NULL;
+
+/* =========================================================================
+ *                              CONSTANTS
+ * ========================================================================= */
+
+#define APP_VERSION_W   L"1.0.16"
+#define APP_NAME_W      L"Dante CLI"
+#define APP_WINDOW_CLS  L"DanteCLIMainWindow"
+
+#define SIDEBAR_W       240
+#define TABBAR_H        38
+#define TOOLBAR_AI_H    36
+#define STATUSBAR_H     26
+#define SIDEBAR_HDR_H   44
+#define CELL_PAD_X      2
+#define MAX_TABS        32
+#define MAX_FAVORITES   64
+#define MAX_SNIPPETS    64
+#define MAX_CREDS       64
+#define MAX_COLS        400
+#define MAX_ROWS        200
+#define SCROLLBACK_CAP  5000
+
+/* Tokyo Night palette — matches the Swift default theme. */
+#define COL_BG          RGB(0x1A, 0x1B, 0x26)
+#define COL_BG_SIDE     RGB(0x16, 0x16, 0x1E)
+#define COL_BG_TABBAR   RGB(0x1A, 0x1B, 0x26)
+#define COL_BG_TERM     RGB(0x1A, 0x1B, 0x26)
+#define COL_BG_STATUS   RGB(0x16, 0x16, 0x1E)
+#define COL_DIV         RGB(0x29, 0x2E, 0x42)
+#define COL_FG          RGB(0xC0, 0xCA, 0xF5)
+#define COL_FG_DIM      RGB(0x56, 0x5F, 0x89)
+#define COL_ACCENT      RGB(0x7A, 0xA2, 0xF7)
+#define COL_ACCENT2     RGB(0xBB, 0x9A, 0xF7)
+#define COL_GREEN       RGB(0x9E, 0xCE, 0x6A)
+#define COL_ORANGE      RGB(0xFF, 0x9E, 0x64)
+#define COL_RED         RGB(0xF7, 0x76, 0x8E)
+#define COL_YELLOW      RGB(0xE0, 0xAF, 0x68)
+#define COL_CYAN        RGB(0x7D, 0xCF, 0xFF)
+#define COL_MAGENTA     RGB(0xBB, 0x9A, 0xF7)
+#define COL_BG_CHIP     RGB(0x24, 0x28, 0x3B)
+#define COL_BG_CHIP_H   RGB(0x32, 0x38, 0x52)
+#define COL_TAB_ACTIVE  RGB(0x7A, 0xA2, 0xF7)
+
+/* Terminal color schemes — 19 named themes matching the Swift app. */
+typedef struct {
+    const wchar_t* id;
+    const wchar_t* displayName;
+    COLORREF bg;
+    COLORREF fg;
+    COLORREF cursor;
+    COLORREF ansi[16];
+} ColorScheme;
+
+static const ColorScheme kSchemes[] = {
+    { L"tokyo-night", L"Tokyo Night",
+        RGB(0x1A,0x1B,0x26), RGB(0xC0,0xCA,0xF5), RGB(0x7A,0xA2,0xF7), {
+        RGB(0x15,0x16,0x1E), RGB(0xF7,0x76,0x8E), RGB(0x9E,0xCE,0x6A), RGB(0xE0,0xAF,0x68),
+        RGB(0x7A,0xA2,0xF7), RGB(0xBB,0x9A,0xF7), RGB(0x7D,0xCF,0xFF), RGB(0xA9,0xB1,0xD6),
+        RGB(0x41,0x48,0x68), RGB(0xF7,0x76,0x8E), RGB(0x9E,0xCE,0x6A), RGB(0xE0,0xAF,0x68),
+        RGB(0x7A,0xA2,0xF7), RGB(0xBB,0x9A,0xF7), RGB(0x7D,0xCF,0xFF), RGB(0xC0,0xCA,0xF5)} },
+    { L"dracula", L"Dracula",
+        RGB(0x28,0x2A,0x36), RGB(0xF8,0xF8,0xF2), RGB(0xFF,0x79,0xC6), {
+        RGB(0x21,0x22,0x2C), RGB(0xFF,0x55,0x55), RGB(0x50,0xFA,0x7B), RGB(0xF1,0xFA,0x8C),
+        RGB(0xBD,0x93,0xF9), RGB(0xFF,0x79,0xC6), RGB(0x8B,0xE9,0xFD), RGB(0xF8,0xF8,0xF2),
+        RGB(0x62,0x72,0xA4), RGB(0xFF,0x6E,0x6E), RGB(0x69,0xFF,0x94), RGB(0xFF,0xFF,0xA5),
+        RGB(0xD6,0xAC,0xFF), RGB(0xFF,0x92,0xDF), RGB(0xA4,0xFF,0xFF), RGB(0xFF,0xFF,0xFF)} },
+    { L"nord", L"Nord",
+        RGB(0x2E,0x34,0x40), RGB(0xD8,0xDE,0xE9), RGB(0x88,0xC0,0xD0), {
+        RGB(0x3B,0x42,0x52), RGB(0xBF,0x61,0x6A), RGB(0xA3,0xBE,0x8C), RGB(0xEB,0xCB,0x8B),
+        RGB(0x81,0xA1,0xC1), RGB(0xB4,0x8E,0xAD), RGB(0x88,0xC0,0xD0), RGB(0xE5,0xE9,0xF0),
+        RGB(0x4C,0x56,0x6A), RGB(0xBF,0x61,0x6A), RGB(0xA3,0xBE,0x8C), RGB(0xEB,0xCB,0x8B),
+        RGB(0x81,0xA1,0xC1), RGB(0xB4,0x8E,0xAD), RGB(0x8F,0xBC,0xBB), RGB(0xEC,0xEF,0xF4)} },
+    { L"one-dark", L"One Dark",
+        RGB(0x28,0x2C,0x34), RGB(0xAB,0xB2,0xBF), RGB(0x52,0x8B,0xFF), {
+        RGB(0x00,0x00,0x00), RGB(0xE0,0x6C,0x75), RGB(0x98,0xC3,0x79), RGB(0xE5,0xC0,0x7B),
+        RGB(0x61,0xAF,0xEF), RGB(0xC6,0x78,0xDD), RGB(0x56,0xB6,0xC2), RGB(0xAB,0xB2,0xBF),
+        RGB(0x5C,0x63,0x70), RGB(0xE0,0x6C,0x75), RGB(0x98,0xC3,0x79), RGB(0xE5,0xC0,0x7B),
+        RGB(0x61,0xAF,0xEF), RGB(0xC6,0x78,0xDD), RGB(0x56,0xB6,0xC2), RGB(0xFF,0xFF,0xFF)} },
+    { L"solarized-dark", L"Solarized Dark",
+        RGB(0x00,0x2B,0x36), RGB(0x83,0x94,0x96), RGB(0x93,0xA1,0xA1), {
+        RGB(0x07,0x36,0x42), RGB(0xDC,0x32,0x2F), RGB(0x85,0x99,0x00), RGB(0xB5,0x89,0x00),
+        RGB(0x26,0x8B,0xD2), RGB(0xD3,0x36,0x82), RGB(0x2A,0xA1,0x98), RGB(0xEE,0xE8,0xD5),
+        RGB(0x58,0x6E,0x75), RGB(0xCB,0x4B,0x16), RGB(0x58,0x6E,0x75), RGB(0x65,0x7B,0x83),
+        RGB(0x83,0x94,0x96), RGB(0x6C,0x71,0xC4), RGB(0x93,0xA1,0xA1), RGB(0xFD,0xF6,0xE3)} },
+    { L"solarized-light", L"Solarized Light",
+        RGB(0xFD,0xF6,0xE3), RGB(0x65,0x7B,0x83), RGB(0x58,0x6E,0x75), {
+        RGB(0xEE,0xE8,0xD5), RGB(0xDC,0x32,0x2F), RGB(0x85,0x99,0x00), RGB(0xB5,0x89,0x00),
+        RGB(0x26,0x8B,0xD2), RGB(0xD3,0x36,0x82), RGB(0x2A,0xA1,0x98), RGB(0x07,0x36,0x42),
+        RGB(0xFD,0xF6,0xE3), RGB(0xCB,0x4B,0x16), RGB(0x93,0xA1,0xA1), RGB(0x83,0x94,0x96),
+        RGB(0x65,0x7B,0x83), RGB(0x6C,0x71,0xC4), RGB(0x58,0x6E,0x75), RGB(0x00,0x2B,0x36)} },
+    { L"gruvbox-dark", L"Gruvbox Dark",
+        RGB(0x28,0x28,0x28), RGB(0xEB,0xDB,0xB2), RGB(0xFE,0x80,0x19), {
+        RGB(0x28,0x28,0x28), RGB(0xCC,0x24,0x1D), RGB(0x98,0x97,0x1A), RGB(0xD7,0x99,0x21),
+        RGB(0x45,0x85,0x88), RGB(0xB1,0x62,0x86), RGB(0x68,0x9D,0x6A), RGB(0xA8,0x99,0x84),
+        RGB(0x92,0x83,0x74), RGB(0xFB,0x49,0x34), RGB(0xB8,0xBB,0x26), RGB(0xFA,0xBD,0x2F),
+        RGB(0x83,0xA5,0x98), RGB(0xD3,0x86,0x9B), RGB(0x8E,0xC0,0x7C), RGB(0xEB,0xDB,0xB2)} },
+    { L"monokai", L"Monokai",
+        RGB(0x27,0x28,0x22), RGB(0xF8,0xF8,0xF2), RGB(0xF8,0xF8,0xF0), {
+        RGB(0x27,0x28,0x22), RGB(0xF9,0x26,0x72), RGB(0xA6,0xE2,0x2E), RGB(0xF4,0xBF,0x75),
+        RGB(0x66,0xD9,0xEF), RGB(0xAE,0x81,0xFF), RGB(0xA1,0xEF,0xE4), RGB(0xF8,0xF8,0xF2),
+        RGB(0x75,0x71,0x5E), RGB(0xF9,0x26,0x72), RGB(0xA6,0xE2,0x2E), RGB(0xF4,0xBF,0x75),
+        RGB(0x66,0xD9,0xEF), RGB(0xAE,0x81,0xFF), RGB(0xA1,0xEF,0xE4), RGB(0xF9,0xF8,0xF5)} },
+    { L"catppuccin-mocha", L"Catppuccin Mocha",
+        RGB(0x1E,0x1E,0x2E), RGB(0xCD,0xD6,0xF4), RGB(0xF5,0xE0,0xDC), {
+        RGB(0x45,0x47,0x5A), RGB(0xF3,0x8B,0xA8), RGB(0xA6,0xE3,0xA1), RGB(0xF9,0xE2,0xAF),
+        RGB(0x89,0xB4,0xFA), RGB(0xF5,0xC2,0xE7), RGB(0x94,0xE2,0xD5), RGB(0xBA,0xC2,0xDE),
+        RGB(0x58,0x5B,0x70), RGB(0xF3,0x8B,0xA8), RGB(0xA6,0xE3,0xA1), RGB(0xF9,0xE2,0xAF),
+        RGB(0x89,0xB4,0xFA), RGB(0xF5,0xC2,0xE7), RGB(0x94,0xE2,0xD5), RGB(0xA6,0xAD,0xC8)} },
+    { L"github-dark", L"GitHub Dark",
+        RGB(0x0D,0x11,0x17), RGB(0xC9,0xD1,0xD9), RGB(0x58,0xA6,0xFF), {
+        RGB(0x48,0x4F,0x58), RGB(0xFF,0x7B,0x72), RGB(0x3F,0xB9,0x50), RGB(0xD2,0x99,0x22),
+        RGB(0x58,0xA6,0xFF), RGB(0xBC,0x8C,0xFF), RGB(0x39,0xC5,0xCF), RGB(0xB1,0xBA,0xC4),
+        RGB(0x6E,0x76,0x81), RGB(0xFF,0xA1,0x98), RGB(0x56,0xD3,0x64), RGB(0xE3,0xB3,0x41),
+        RGB(0x79,0xC0,0xFF), RGB(0xD2,0xA8,0xFF), RGB(0x56,0xD4,0xDD), RGB(0xF0,0xF6,0xFC)} },
+    { L"material-dark", L"Material Dark",
+        RGB(0x21,0x21,0x21), RGB(0xEE,0xFF,0xFF), RGB(0xFF,0xCB,0x6B), {
+        RGB(0x00,0x00,0x00), RGB(0xF0,0x71,0x78), RGB(0xC3,0xE8,0x8D), RGB(0xFF,0xCB,0x6B),
+        RGB(0x82,0xAA,0xFF), RGB(0xC7,0x92,0xEA), RGB(0x89,0xDD,0xFF), RGB(0xEE,0xFF,0xFF),
+        RGB(0x54,0x54,0x54), RGB(0xFF,0x53,0x70), RGB(0xC3,0xE8,0x8D), RGB(0xFF,0xCB,0x6B),
+        RGB(0x82,0xAA,0xFF), RGB(0xC7,0x92,0xEA), RGB(0x89,0xDD,0xFF), RGB(0xFF,0xFF,0xFF)} },
+    { L"night-owl", L"Night Owl",
+        RGB(0x01,0x16,0x27), RGB(0xD6,0xDE,0xEB), RGB(0x80,0xA4,0xC2), {
+        RGB(0x01,0x16,0x27), RGB(0xEF,0x53,0x50), RGB(0x22,0xDA,0x6E), RGB(0xC5,0xE4,0x78),
+        RGB(0x82,0xAA,0xFF), RGB(0xC7,0x92,0xEA), RGB(0x7F,0xDB,0xCA), RGB(0xFF,0xFF,0xFF),
+        RGB(0x57,0x5B,0x66), RGB(0xEF,0x53,0x50), RGB(0x22,0xDA,0x6E), RGB(0xFF,0xEB,0x95),
+        RGB(0x82,0xAA,0xFF), RGB(0xC7,0x92,0xEA), RGB(0x7F,0xDB,0xCA), RGB(0xFF,0xFF,0xFF)} },
+    { L"synthwave84", L"Synthwave '84",
+        RGB(0x26,0x21,0x35), RGB(0xFF,0x7E,0xDB), RGB(0xF9,0x7E,0x72), {
+        RGB(0x26,0x21,0x35), RGB(0xF9,0x7E,0x72), RGB(0x72,0xF1,0xB8), RGB(0xFE,0xDE,0x5D),
+        RGB(0x36,0xF9,0xF6), RGB(0xFF,0x7E,0xDB), RGB(0x36,0xF9,0xF6), RGB(0xFF,0xFF,0xFF),
+        RGB(0x49,0x5E,0x80), RGB(0xF9,0x7E,0x72), RGB(0x72,0xF1,0xB8), RGB(0xFE,0xDE,0x5D),
+        RGB(0x36,0xF9,0xF6), RGB(0xFF,0x7E,0xDB), RGB(0x36,0xF9,0xF6), RGB(0xFF,0xFF,0xFF)} },
+    { L"cobalt", L"Cobalt",
+        RGB(0x00,0x2B,0x4F), RGB(0xFF,0xFF,0xFF), RGB(0xFF,0xAB,0x00), {
+        RGB(0x00,0x29,0x4D), RGB(0xFF,0x26,0x00), RGB(0x3A,0xD9,0x00), RGB(0xFF,0xC6,0x00),
+        RGB(0x00,0x88,0xFF), RGB(0xFB,0x94,0xFF), RGB(0x00,0xD8,0xFF), RGB(0xFF,0xFF,0xFF),
+        RGB(0x80,0x9D,0xB8), RGB(0xFF,0x26,0x00), RGB(0x3A,0xD9,0x00), RGB(0xFF,0xC6,0x00),
+        RGB(0x00,0x88,0xFF), RGB(0xFB,0x94,0xFF), RGB(0x00,0xD8,0xFF), RGB(0xFF,0xFF,0xFF)} },
+    { L"palenight", L"Palenight",
+        RGB(0x29,0x2D,0x3E), RGB(0xC0,0xCA,0xF5), RGB(0xA6,0xAC,0xCD), {
+        RGB(0x29,0x2D,0x3E), RGB(0xE3,0x4D,0x4D), RGB(0xC3,0xE8,0x8D), RGB(0xFF,0xCB,0x6B),
+        RGB(0x82,0xAA,0xFF), RGB(0xC7,0x92,0xEA), RGB(0x89,0xDD,0xFF), RGB(0xFF,0xFF,0xFF),
+        RGB(0x67,0x6E,0x95), RGB(0xFF,0x59,0x70), RGB(0xC3,0xE8,0x8D), RGB(0xFF,0xCB,0x6B),
+        RGB(0x82,0xAA,0xFF), RGB(0xC7,0x92,0xEA), RGB(0x89,0xDD,0xFF), RGB(0xFF,0xFF,0xFF)} },
+    { L"gruvbox-light", L"Gruvbox Light",
+        RGB(0xFB,0xF1,0xC7), RGB(0x3C,0x38,0x36), RGB(0xAF,0x3A,0x03), {
+        RGB(0xFB,0xF1,0xC7), RGB(0xCC,0x24,0x1D), RGB(0x79,0x74,0x0E), RGB(0xB5,0x76,0x14),
+        RGB(0x07,0x66,0x78), RGB(0x8F,0x3F,0x71), RGB(0x42,0x7B,0x58), RGB(0x7C,0x6F,0x64),
+        RGB(0x92,0x83,0x74), RGB(0x9D,0x00,0x06), RGB(0x79,0x74,0x0E), RGB(0xB5,0x76,0x14),
+        RGB(0x07,0x66,0x78), RGB(0x8F,0x3F,0x71), RGB(0x42,0x7B,0x58), RGB(0x3C,0x38,0x36)} },
+    { L"github-light", L"GitHub Light",
+        RGB(0xFF,0xFF,0xFF), RGB(0x24,0x29,0x2F), RGB(0x05,0x69,0xD1), {
+        RGB(0x24,0x29,0x2F), RGB(0xCF,0x22,0x2E), RGB(0x11,0x6B,0x29), RGB(0x95,0x3B,0x00),
+        RGB(0x05,0x69,0xD1), RGB(0x83,0x25,0xC5), RGB(0x1B,0x7C,0x83), RGB(0x6E,0x77,0x81),
+        RGB(0x57,0x60,0x6A), RGB(0xA4,0x05,0x10), RGB(0x11,0x6B,0x29), RGB(0x95,0x3B,0x00),
+        RGB(0x05,0x69,0xD1), RGB(0x83,0x25,0xC5), RGB(0x1B,0x7C,0x83), RGB(0x24,0x29,0x2F)} },
+    { L"apple-classic", L"Apple Classic",
+        RGB(0x00,0x00,0x00), RGB(0xB6,0xB6,0xB6), RGB(0xC2,0xC2,0xC2), {
+        RGB(0x00,0x00,0x00), RGB(0xC9,0x1B,0x00), RGB(0x00,0xC2,0x00), RGB(0xC7,0xC4,0x00),
+        RGB(0x02,0x25,0xC7), RGB(0xC9,0x30,0xC7), RGB(0x00,0xC5,0xC7), RGB(0xC7,0xC7,0xC7),
+        RGB(0x67,0x67,0x67), RGB(0xFF,0x6D,0x67), RGB(0x5F,0xF9,0x67), RGB(0xFE,0xFB,0x67),
+        RGB(0x67,0x71,0xFF), RGB(0xFF,0x76,0xFF), RGB(0x5F,0xFD,0xFF), RGB(0xFF,0xFF,0xFF)} },
+    { L"catppuccin-latte", L"Catppuccin Latte",
+        RGB(0xEF,0xF1,0xF5), RGB(0x4C,0x4F,0x69), RGB(0xDC,0x8A,0x78), {
+        RGB(0x5C,0x5F,0x77), RGB(0xD2,0x0F,0x39), RGB(0x40,0xA0,0x2B), RGB(0xDF,0x8E,0x1D),
+        RGB(0x1E,0x66,0xF5), RGB(0xEA,0x76,0xCB), RGB(0x17,0x9D,0x9F), RGB(0xAC,0xB0,0xBE),
+        RGB(0x6C,0x6F,0x85), RGB(0xD2,0x0F,0x39), RGB(0x40,0xA0,0x2B), RGB(0xDF,0x8E,0x1D),
+        RGB(0x1E,0x66,0xF5), RGB(0xEA,0x76,0xCB), RGB(0x17,0x9D,0x9F), RGB(0x4C,0x4F,0x69)} },
+};
+
+#define SCHEME_COUNT ((int)(sizeof(kSchemes) / sizeof(kSchemes[0])))
+
+static int g_schemeIdx = 0;  /* index into kSchemes; default Tokyo Night */
+
+static const ColorScheme* current_scheme(void) {
+    if (g_schemeIdx < 0 || g_schemeIdx >= SCHEME_COUNT) return &kSchemes[0];
+    return &kSchemes[g_schemeIdx];
+}
+
+#define kAnsiPalette (current_scheme()->ansi)
+
+/* Tab chip colors (Apple-style, 12 solid). */
+static const COLORREF kTabColors[12] = {
+    RGB(0x8E, 0x8E, 0x93), /* neutral */
+    RGB(0xFF, 0x45, 0x3A), /* red     */
+    RGB(0xFF, 0x9F, 0x0A), /* orange  */
+    RGB(0xFF, 0xD6, 0x0A), /* yellow  */
+    RGB(0x30, 0xD1, 0x58), /* green   */
+    RGB(0x63, 0xE6, 0xBE), /* mint    */
+    RGB(0x64, 0xD2, 0xFF), /* cyan    */
+    RGB(0x0A, 0x84, 0xFF), /* blue    */
+    RGB(0x5E, 0x5C, 0xE6), /* indigo  */
+    RGB(0xBF, 0x5A, 0xF2), /* purple  */
+    RGB(0xFF, 0x37, 0x5F), /* pink    */
+    RGB(0xAC, 0x8E, 0x68), /* brown   */
+};
+
+/* Split workspace — preset library with arbitrary rectangular cells laid out
+ * in percentage coordinates (0..100) of the terminal area. Each preset has
+ * a category for grouping in the popup menu. Up to 9 cells (Grid 3×3).    */
+
+#define MAX_SPLIT_CELLS 9
+
+typedef struct { short x, y, w, h; } SplitCell;
+
+typedef enum {
+    SCAT_SIMPLE = 0,
+    SCAT_DASHBOARD,
+    SCAT_IDE,
+    SCAT_OPS,
+    SCAT_COUNT
+} SplitCategory;
+
+static const wchar_t* kSplitCategoryNames[SCAT_COUNT] = {
+    L"Simples", L"Dashboard", L"IDE", L"Operações"
+};
+
+typedef struct {
+    const wchar_t* name;
+    SplitCategory  category;
+    int            cellCount;
+    SplitCell      cells[MAX_SPLIT_CELLS];
+} SplitPreset;
+
+static const SplitPreset kPresets[] = {
+    /* ── Simples ───────────────────────────────────────────────────────── */
+    { L"Sem split (uma aba)",       SCAT_SIMPLE, 1, {
+        {0,0,100,100} } },
+    { L"Lado a lado (2)",           SCAT_SIMPLE, 2, {
+        {0,0,50,100}, {50,0,50,100} } },
+    { L"Empilhados (2)",            SCAT_SIMPLE, 2, {
+        {0,0,100,50}, {0,50,100,50} } },
+    { L"3 colunas",                 SCAT_SIMPLE, 3, {
+        {0,0,33,100}, {33,0,34,100}, {67,0,33,100} } },
+    { L"3 empilhados",              SCAT_SIMPLE, 3, {
+        {0,0,100,33}, {0,33,100,34}, {0,67,100,33} } },
+    { L"Quartos 2×2",               SCAT_SIMPLE, 4, {
+        {0,0,50,50},  {50,0,50,50},
+        {0,50,50,50}, {50,50,50,50} } },
+
+    /* ── Dashboard ─────────────────────────────────────────────────────── */
+    { L"Header + 3 colunas",        SCAT_DASHBOARD, 4, {
+        {0,0,100,40},
+        {0,40,33,60}, {33,40,34,60}, {67,40,33,60} } },
+    { L"Cinema 1+4",                SCAT_DASHBOARD, 5, {
+        {0,0,100,55},
+        {0,55,25,45}, {25,55,25,45}, {50,55,25,45}, {75,55,25,45} } },
+    { L"Mosaico 2+1",               SCAT_DASHBOARD, 3, {
+        {0,0,50,50},  {0,50,50,50},
+        {50,0,50,100} } },
+    { L"Grid 3×2",                  SCAT_DASHBOARD, 6, {
+        {0,0,33,50},   {33,0,34,50},   {67,0,33,50},
+        {0,50,33,50},  {33,50,34,50},  {67,50,33,50} } },
+    { L"Grid 3×3",                  SCAT_DASHBOARD, 9, {
+        {0,0,33,33},   {33,0,34,33},   {67,0,33,33},
+        {0,33,33,34},  {33,33,34,34},  {67,33,33,34},
+        {0,67,33,33},  {33,67,34,33},  {67,67,33,33} } },
+
+    /* ── IDE ───────────────────────────────────────────────────────────── */
+    { L"Editor + Terminal",         SCAT_IDE, 2, {
+        {0,0,100,70}, {0,70,100,30} } },
+    { L"Editor + Sidebar",          SCAT_IDE, 2, {
+        {0,0,35,100}, {35,0,65,100} } },
+    { L"Editor + 2 painéis direita", SCAT_IDE, 3, {
+        {0,0,60,100},
+        {60,0,40,50}, {60,50,40,50} } },
+    { L"Editor + Terminal + Logs",  SCAT_IDE, 3, {
+        {0,0,60,60},   {60,0,40,60},
+        {0,60,100,40} } },
+    { L"Sidebar + Main + Inspector", SCAT_IDE, 3, {
+        {0,0,22,100}, {22,0,56,100}, {78,0,22,100} } },
+    { L"Master / Detail",           SCAT_IDE, 2, {
+        {0,0,40,100}, {40,0,60,100} } },
+    { L"Foco esquerdo 80%",         SCAT_IDE, 2, {
+        {0,0,80,100}, {80,0,20,100} } },
+
+    /* ── Operações ─────────────────────────────────────────────────────── */
+    { L"Main + 4 painéis lateral",  SCAT_OPS, 5, {
+        {0,0,75,100},
+        {75,0,25,25},  {75,25,25,25}, {75,50,25,25}, {75,75,25,25} } },
+    { L"Quadrante + faixas",        SCAT_OPS, 3, {
+        {0,0,60,100},
+        {60,0,40,50}, {60,50,40,50} } },
+    { L"Editor + 4 logs",           SCAT_OPS, 5, {
+        {0,0,60,100},
+        {60,0,40,25},  {60,25,40,25}, {60,50,40,25}, {60,75,40,25} } },
+};
+
+#define PRESET_COUNT  ((int)(sizeof(kPresets) / sizeof(kPresets[0])))
+#define PRESET_SINGLE 0  /* index 0 is always the single-pane layout */
+
+/* Sidebar mode tabs. */
+typedef enum {
+    MODE_FAVORITES = 0,
+    MODE_FILES     = 1,
+    MODE_SNIPPETS  = 2,
+    MODE_CREDS     = 3,
+    MODE_COUNT
+} SidebarMode;
+
+static const wchar_t* kSidebarModeIcons[MODE_COUNT] = {
+    L"★",   /* ★ */
+    L"\U0001F4C1", /* 📁 */
+    L"⚡",   /* ⚡ */
+    L"\U0001F511", /* 🔑 */
+};
+static const wchar_t* kSidebarModeLabels[MODE_COUNT] = {
+    L"Favoritos", L"Pastas", L"Snippets", L"Chaves",
+};
+
+/* =========================================================================
+ *                         TERMINAL CELL GRID
+ * ========================================================================= */
+
+typedef struct {
+    wchar_t ch;
+    uint16_t attr;     /* bit flags */
+    uint8_t  fgIdx;    /* index into ANSI 16 or extended */
+    uint8_t  bgIdx;
+    COLORREF fgRgb;    /* used when attr has ATTR_FG_RGB */
+    COLORREF bgRgb;    /* used when attr has ATTR_BG_RGB */
+} Cell;
+
+#define ATTR_BOLD       0x0001
+#define ATTR_ITALIC     0x0002
+#define ATTR_UNDERLINE  0x0004
+#define ATTR_REVERSE    0x0008
+#define ATTR_FG_RGB     0x0010
+#define ATTR_BG_RGB     0x0020
+#define ATTR_FG_DEFAULT 0x0040
+#define ATTR_BG_DEFAULT 0x0080
+
+typedef struct {
+    Cell* cells;      /* cols * rows */
+    int cols;
+    int rows;
+    int cursorRow;
+    int cursorCol;
+    Cell currentAttr;
+    int dirty;
+    /* Scrollback */
+    Cell* scrollback; /* cols * SCROLLBACK_CAP */
+    int scrollbackLines;
+} TerminalGrid;
+
+/* =========================================================================
+ *                          ANSI PARSER STATE
+ * ========================================================================= */
+
+typedef enum {
+    AP_GROUND,
+    AP_ESC,
+    AP_CSI,
+    AP_OSC,
+    AP_UTF8,
+} ApState;
+
+typedef struct {
+    ApState state;
+    char paramBuf[64];
+    int  paramLen;
+    char oscBuf[512];
+    int  oscLen;
+    /* UTF-8 multibyte assembly */
+    uint32_t utf8Code;
+    int utf8Remaining;
+} AnsiParser;
+
+/* =========================================================================
+ *                              SESSION
+ * ========================================================================= */
+
+typedef struct {
+    HPCON  hPC;
+    HANDLE hPipeIn;     /* we write child stdin */
+    HANDLE hPipeOut;    /* we read child stdout */
+    HANDLE hChildIn;
+    HANDLE hChildOut;
+    HANDLE hProcess;
+    HANDLE hThread;
+    HANDLE hJob;
+    HANDLE hReaderThread;
+    BOOL   alive;
+    DWORD  pid;
+    int    ownerTabId;   /* stable id of the Tab owning this session — used in
+                          * cross-thread output messages so we never deref
+                          * potentially-freed Session* in the UI thread.    */
+    wchar_t shellName[64];
+    wchar_t cwd[MAX_PATH];
+} Session;
+
+typedef struct {
+    int          id;
+    wchar_t      title[128];
+    wchar_t      emoji[8];
+    int          colorIdx;   /* index into kTabColors, -1 = none */
+    BOOL         pinned;
+    Session*     session;
+    TerminalGrid grid;
+    AnsiParser   parser;
+} Tab;
+
+/* =========================================================================
+ *                            APP STATE
+ * ========================================================================= */
+
+typedef struct { wchar_t name[128]; wchar_t path[MAX_PATH]; wchar_t emoji[8]; } Favorite;
+typedef struct { wchar_t name[128]; wchar_t cmd[512];     wchar_t emoji[8]; } Snippet;
+typedef struct { wchar_t name[128]; wchar_t kind[16];     wchar_t user[64]; wchar_t host[128]; wchar_t emoji[8]; } Credential;
+
+typedef struct {
+    HWND     hWnd;
+    HWND     hStatus;
+    HFONT    hFontUI;
+    HFONT    hFontMono;
+    HFONT    hFontMonoBold;
+    HFONT    hFontEmoji;
+    HFONT    hFontBig;
+    int      cellW;
+    int      cellH;
+    Tab*     tabs[MAX_TABS];
+    int      tabCount;
+    int      activeTab;
+    SidebarMode sidebarMode;
+    int      tabBarScroll;
+    int      tabBarHoverIdx;
+    int      sidebarHoverIdx;
+    int      sidebarItemHoverIdx;
+    Favorite   favorites[MAX_FAVORITES];   int favoriteCount;
+    Snippet    snippets[MAX_SNIPPETS];     int snippetCount;
+    Credential creds[MAX_CREDS];           int credCount;
+    /* Settings */
+    wchar_t    groqApiKey[128];
+    wchar_t    voiceLang[16];   /* ISO-639 like "pt", "en" */
+    int        fontPxOverride;  /* 0 = default */
+    int        scrollbackLines;
+    HBRUSH   brBg, brBgSide, brBgTabBar, brBgTerm, brBgStatus;
+    HBRUSH   brBgChip, brBgChipH, brAccent;
+    HPEN     penDiv, penAccent;
+    CRITICAL_SECTION lock;
+    BOOL     resizeScheduled;
+    UINT_PTR resizeTimer;
+    UINT_PTR statsTimer;
+    UINT_PTR repaintTimer;
+    UINT_PTR persistTimer;
+    int      pendingRepaint;
+    int      pendingPersist;
+    /* Drag state for tab reorder */
+    int      dragTabIdx;
+    int      dragStartX;
+    int      dragOffsetX;
+    /* Modal state */
+    BOOL     cheatsheetVisible;
+    /* Sidebar list scroll */
+    int      sidebarScroll;
+    /* Split workspace */
+    int          splitLayout;                       /* index into kPresets[] */
+    int          splitSlots[MAX_SPLIT_CELLS];       /* indices into tabs[]; -1 = empty */
+    int          splitActiveCell;                   /* which cell currently has focus */
+} App;
+
+static App g_app;
+
+/* =========================================================================
+ *                       FORWARD DECLARATIONS
+ * ========================================================================= */
+
+static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
+static void layout_compute(RECT* outSide, RECT* outTabBar, RECT* outTerm, RECT* outToolbar, RECT* outStatus);
+static void terminal_grid_init(TerminalGrid* g, int cols, int rows);
+static void terminal_grid_resize(TerminalGrid* g, int cols, int rows);
+static void terminal_grid_free(TerminalGrid* g);
+static void grid_put_char(TerminalGrid* g, wchar_t ch);
+static void grid_line_feed(TerminalGrid* g);
+static void grid_carriage_return(TerminalGrid* g);
+static void grid_backspace(TerminalGrid* g);
+static void grid_tab_advance(TerminalGrid* g);
+static void grid_set_cursor(TerminalGrid* g, int row, int col);
+static void grid_erase_display(TerminalGrid* g, int mode);
+static void grid_erase_line(TerminalGrid* g, int mode);
+static void grid_scroll_up(TerminalGrid* g);
+static void parser_init(AnsiParser* p);
+static void parser_feed(Tab* t, const char* bytes, int n);
+static Session* session_create(const wchar_t* shellId, int cols, int rows);
+static void session_destroy(Session* s);
+static void session_resize(Session* s, int cols, int rows);
+static void session_write(Session* s, const void* data, int n);
+static DWORD WINAPI reader_thread(LPVOID arg);
+static void invalidate_terminal(void);
+static void open_new_tab(const wchar_t* shellId);
+static void close_tab(int idx);
+static void inject_into_active(const wchar_t* text);
+static void draw_sidebar(HDC dc, const RECT* rc);
+static void draw_tabbar(HDC dc, const RECT* rc);
+static void draw_terminal(HDC dc, const RECT* rc);
+static void draw_toolbar(HDC dc, const RECT* rc);
+static int  hit_test_tab(int x, int y, const RECT* tabBarRc);
+static int  hit_test_sidebar_mode(int x, int y, const RECT* sideRc);
+static int  hit_test_sidebar_item(int x, int y, const RECT* sideRc);
+static int  hit_test_toolbar_action(int x, int y, const RECT* toolbarRc);
+static int  hit_test_tab_close(int x, int y, const RECT* tabBarRc, int tabIdx);
+static int  hit_test_new_tab(int x, int y, const RECT* tabBarRc);
+static void update_status(void);
+static void persist_save(void);
+static void persist_load(void);
+static void schedule_persist(void);
+static void show_tab_context_menu(HWND hWnd, int tabIdx, int x, int y);
+static void show_add_dialog(void);
+static BOOL prompt_text(const wchar_t* title, const wchar_t* prompt, wchar_t* out, int outCap);
+static void cheatsheet_toggle(void);
+static void draw_cheatsheet(HDC dc, const RECT* cli);
+static void show_settings_dialog(void);
+static void show_split_menu(HWND hWnd, int x, int y);
+static void set_split_layout(int layoutId);
+static void draw_terminal_cell(HDC dc, const RECT* rc, int tabIdx, BOOL hasFocus);
+static int  active_tab_index(void);
+static RECT split_cell_rect(const RECT* parent, const SplitCell* c);
+static wchar_t* utf8_to_w_dup(const char* s, int n);
+static char* w_to_utf8_dup(const wchar_t* w);
+static void show_about(void);
+static void check_for_updates_async(void);
+static void fill_rect_color(HDC dc, const RECT* r, COLORREF c);
+static void draw_text_w(HDC dc, int x, int y, const wchar_t* s, COLORREF color, HFONT font);
+static void draw_rounded_rect(HDC dc, RECT r, COLORREF fill, COLORREF border, int radius);
+
+static int next_tab_id = 1;
+
+/* =========================================================================
+ *                             UTILITIES
+ * ========================================================================= */
+
+static int min_int(int a, int b) { return a < b ? a : b; }
+static int max_int(int a, int b) { return a > b ? a : b; }
+static int clamp_int(int x, int lo, int hi) { return x < lo ? lo : (x > hi ? hi : x); }
+
+static void str_copy_w(wchar_t* dst, size_t cap, const wchar_t* src) {
+    if (cap == 0) return;
+    size_t i = 0;
+    while (i + 1 < cap && src[i]) { dst[i] = src[i]; ++i; }
+    dst[i] = 0;
+}
+
+static void* xcalloc(size_t n, size_t sz) {
+    void* p = calloc(n, sz);
+    if (!p) { MessageBoxW(NULL, L"Out of memory", APP_NAME_W, MB_ICONERROR); ExitProcess(2); }
+    return p;
+}
+
+static wchar_t* expand_env(const wchar_t* src) {
+    static wchar_t buf[MAX_PATH * 2];
+    ExpandEnvironmentStringsW(src, buf, MAX_PATH * 2);
+    return buf;
+}
+
+/* =========================================================================
+ *                        TERMINAL GRID OPS
+ * ========================================================================= */
+
+static Cell make_default_cell(void) {
+    Cell c = {0};
+    c.ch = L' ';
+    c.attr = ATTR_FG_DEFAULT | ATTR_BG_DEFAULT;
+    return c;
+}
+
+static void terminal_grid_init(TerminalGrid* g, int cols, int rows) {
+    g->cols = cols;
+    g->rows = rows;
+    g->cursorRow = 0;
+    g->cursorCol = 0;
+    g->currentAttr = make_default_cell();
+    g->dirty = 1;
+    g->scrollbackLines = 0;
+    g->cells = (Cell*)xcalloc(cols * rows, sizeof(Cell));
+    g->scrollback = (Cell*)xcalloc(cols * SCROLLBACK_CAP, sizeof(Cell));
+    for (int i = 0; i < cols * rows; ++i) g->cells[i] = make_default_cell();
+}
+
+static void terminal_grid_free(TerminalGrid* g) {
+    free(g->cells); free(g->scrollback);
+    g->cells = NULL; g->scrollback = NULL;
+}
+
+static void terminal_grid_resize(TerminalGrid* g, int cols, int rows) {
+    if (cols <= 0 || rows <= 0) return;
+    if (cols == g->cols && rows == g->rows) return;
+
+    Cell* nc = (Cell*)xcalloc(cols * rows, sizeof(Cell));
+    for (int i = 0; i < cols * rows; ++i) nc[i] = make_default_cell();
+
+    int copyRows = min_int(g->rows, rows);
+    int copyCols = min_int(g->cols, cols);
+    for (int r = 0; r < copyRows; ++r) {
+        for (int c = 0; c < copyCols; ++c) {
+            nc[r * cols + c] = g->cells[r * g->cols + c];
+        }
+    }
+
+    Cell* nsb = (Cell*)xcalloc(cols * SCROLLBACK_CAP, sizeof(Cell));
+    int sbCopyCols = min_int(g->cols, cols);
+    for (int r = 0; r < g->scrollbackLines; ++r) {
+        for (int c = 0; c < sbCopyCols; ++c) {
+            nsb[r * cols + c] = g->scrollback[r * g->cols + c];
+        }
+        for (int c = sbCopyCols; c < cols; ++c) nsb[r * cols + c] = make_default_cell();
+    }
+
+    free(g->cells); free(g->scrollback);
+    g->cells = nc; g->scrollback = nsb;
+    g->cols = cols; g->rows = rows;
+    g->cursorRow = clamp_int(g->cursorRow, 0, rows - 1);
+    g->cursorCol = clamp_int(g->cursorCol, 0, cols - 1);
+    g->dirty = 1;
+}
+
+static void grid_scroll_up(TerminalGrid* g) {
+    /* Push the top line into scrollback. */
+    if (g->scrollbackLines < SCROLLBACK_CAP) {
+        memcpy(&g->scrollback[g->scrollbackLines * g->cols],
+               &g->cells[0],
+               g->cols * sizeof(Cell));
+        g->scrollbackLines++;
+    } else {
+        memmove(&g->scrollback[0],
+                &g->scrollback[g->cols],
+                (SCROLLBACK_CAP - 1) * g->cols * sizeof(Cell));
+        memcpy(&g->scrollback[(SCROLLBACK_CAP - 1) * g->cols],
+               &g->cells[0],
+               g->cols * sizeof(Cell));
+    }
+    memmove(&g->cells[0],
+            &g->cells[g->cols],
+            (g->rows - 1) * g->cols * sizeof(Cell));
+    for (int c = 0; c < g->cols; ++c)
+        g->cells[(g->rows - 1) * g->cols + c] = make_default_cell();
+    g->dirty = 1;
+}
+
+static void grid_put_char(TerminalGrid* g, wchar_t ch) {
+    if (g->cursorCol >= g->cols) {
+        g->cursorCol = 0;
+        g->cursorRow++;
+        if (g->cursorRow >= g->rows) { grid_scroll_up(g); g->cursorRow = g->rows - 1; }
+    }
+    Cell c = g->currentAttr;
+    c.ch = ch;
+    g->cells[g->cursorRow * g->cols + g->cursorCol] = c;
+    g->cursorCol++;
+    g->dirty = 1;
+}
+
+static void grid_line_feed(TerminalGrid* g) {
+    g->cursorRow++;
+    if (g->cursorRow >= g->rows) { grid_scroll_up(g); g->cursorRow = g->rows - 1; }
+    g->dirty = 1;
+}
+
+static void grid_carriage_return(TerminalGrid* g) { g->cursorCol = 0; g->dirty = 1; }
+
+static void grid_backspace(TerminalGrid* g) {
+    if (g->cursorCol > 0) g->cursorCol--;
+    g->dirty = 1;
+}
+
+static void grid_tab_advance(TerminalGrid* g) {
+    int next = ((g->cursorCol / 8) + 1) * 8;
+    if (next > g->cols - 1) next = g->cols - 1;
+    g->cursorCol = next;
+    g->dirty = 1;
+}
+
+static void grid_set_cursor(TerminalGrid* g, int row, int col) {
+    g->cursorRow = clamp_int(row - 1, 0, g->rows - 1);
+    g->cursorCol = clamp_int(col - 1, 0, g->cols - 1);
+    g->dirty = 1;
+}
+
+static void grid_erase_display(TerminalGrid* g, int mode) {
+    int from = 0, to = g->rows * g->cols;
+    if (mode == 0) from = g->cursorRow * g->cols + g->cursorCol;
+    else if (mode == 1) to = g->cursorRow * g->cols + g->cursorCol;
+    for (int i = from; i < to; ++i) g->cells[i] = make_default_cell();
+    if (mode == 3) g->scrollbackLines = 0;
+    g->dirty = 1;
+}
+
+static void grid_erase_line(TerminalGrid* g, int mode) {
+    int from = 0, to = g->cols;
+    if (mode == 0) from = g->cursorCol;
+    else if (mode == 1) to = g->cursorCol + 1;
+    for (int c = from; c < to; ++c) g->cells[g->cursorRow * g->cols + c] = make_default_cell();
+    g->dirty = 1;
+}
+
+/* =========================================================================
+ *                           ANSI PARSER
+ * ========================================================================= */
+
+static void parser_init(AnsiParser* p) {
+    memset(p, 0, sizeof(*p));
+    p->state = AP_GROUND;
+}
+
+static void parse_params(const char* buf, int* out, int* outCount, int max) {
+    int count = 0, cur = 0;
+    int any = 0;
+    for (int i = 0; buf[i] && count < max; ++i) {
+        char c = buf[i];
+        if (c >= '0' && c <= '9') { cur = cur * 10 + (c - '0'); any = 1; }
+        else if (c == ';') { out[count++] = any ? cur : 0; cur = 0; any = 0; }
+    }
+    if (count < max) out[count++] = any ? cur : 0;
+    *outCount = count;
+}
+
+static void apply_sgr(Cell* attr, const int* p, int n) {
+    if (n == 0 || (n == 1 && p[0] == 0)) { *attr = make_default_cell(); return; }
+    for (int i = 0; i < n; ++i) {
+        int code = p[i];
+        if (code == 0) *attr = make_default_cell();
+        else if (code == 1)  attr->attr |= ATTR_BOLD;
+        else if (code == 3)  attr->attr |= ATTR_ITALIC;
+        else if (code == 4)  attr->attr |= ATTR_UNDERLINE;
+        else if (code == 7)  attr->attr |= ATTR_REVERSE;
+        else if (code == 22) attr->attr &= ~ATTR_BOLD;
+        else if (code == 23) attr->attr &= ~ATTR_ITALIC;
+        else if (code == 24) attr->attr &= ~ATTR_UNDERLINE;
+        else if (code == 27) attr->attr &= ~ATTR_REVERSE;
+        else if (code >= 30 && code <= 37) { attr->fgIdx = (uint8_t)(code - 30); attr->attr &= ~(ATTR_FG_RGB | ATTR_FG_DEFAULT); }
+        else if (code == 39) { attr->attr |= ATTR_FG_DEFAULT; attr->attr &= ~ATTR_FG_RGB; }
+        else if (code >= 40 && code <= 47) { attr->bgIdx = (uint8_t)(code - 40); attr->attr &= ~(ATTR_BG_RGB | ATTR_BG_DEFAULT); }
+        else if (code == 49) { attr->attr |= ATTR_BG_DEFAULT; attr->attr &= ~ATTR_BG_RGB; }
+        else if (code >= 90 && code <= 97)   { attr->fgIdx = (uint8_t)(code - 90 + 8); attr->attr &= ~(ATTR_FG_RGB | ATTR_FG_DEFAULT); }
+        else if (code >= 100 && code <= 107) { attr->bgIdx = (uint8_t)(code - 100 + 8); attr->attr &= ~(ATTR_BG_RGB | ATTR_BG_DEFAULT); }
+        else if ((code == 38 || code == 48) && i + 1 < n) {
+            int kind = p[i + 1];
+            if (kind == 5 && i + 2 < n) {
+                /* 256-indexed — approximate by mapping to nearest of our 16 */
+                int idx = p[i + 2];
+                if (code == 38) { attr->fgIdx = (uint8_t)(idx & 0x0F); attr->attr &= ~(ATTR_FG_RGB | ATTR_FG_DEFAULT); }
+                else            { attr->bgIdx = (uint8_t)(idx & 0x0F); attr->attr &= ~(ATTR_BG_RGB | ATTR_BG_DEFAULT); }
+                i += 2;
+            } else if (kind == 2 && i + 4 < n) {
+                COLORREF c = RGB(p[i + 2] & 0xFF, p[i + 3] & 0xFF, p[i + 4] & 0xFF);
+                if (code == 38) { attr->fgRgb = c; attr->attr |= ATTR_FG_RGB; attr->attr &= ~ATTR_FG_DEFAULT; }
+                else            { attr->bgRgb = c; attr->attr |= ATTR_BG_RGB; attr->attr &= ~ATTR_BG_DEFAULT; }
+                i += 4;
+            }
+        }
+    }
+}
+
+static void handle_csi(Tab* t, char final_byte) {
+    const char* pbuf = t->parser.paramBuf;
+    char prefix = 0;
+
+    /* DEC private-mode sequences have a prefix byte: ? > = <. We capture
+     * them but otherwise just absorb the sequence — PowerShell uses them
+     * for cursor visibility (?25h/l), alt-screen (?1049h/l), bracketed
+     * paste (?2004h/l), focus events (?1004h/l), etc. Without this guard
+     * we'd ignore the prefix and re-interpret '25h' as junk text.        */
+    if (pbuf[0] == '?' || pbuf[0] == '>' || pbuf[0] == '<' || pbuf[0] == '=') {
+        prefix = pbuf[0];
+        pbuf++;
+    }
+
+    int params[16] = {0};
+    int n = 0;
+    parse_params(pbuf, params, &n, 16);
+    int p0 = (n > 0) ? max_int(params[0], 1) : 1;
+    int p1 = (n > 1) ? max_int(params[1], 1) : 1;
+
+    /* Anything with a private-mode prefix is silently absorbed — visually
+     * harmless for now and prevents literal garbage from appearing. */
+    if (prefix) { t->grid.dirty = 1; return; }
+
+    switch (final_byte) {
+        case 'A': t->grid.cursorRow = clamp_int(t->grid.cursorRow - p0, 0, t->grid.rows - 1); break;
+        case 'B': t->grid.cursorRow = clamp_int(t->grid.cursorRow + p0, 0, t->grid.rows - 1); break;
+        case 'C': t->grid.cursorCol = clamp_int(t->grid.cursorCol + p0, 0, t->grid.cols - 1); break;
+        case 'D': t->grid.cursorCol = clamp_int(t->grid.cursorCol - p0, 0, t->grid.cols - 1); break;
+        case 'G': t->grid.cursorCol = clamp_int(p0 - 1, 0, t->grid.cols - 1); break;
+        case 'H': case 'f': grid_set_cursor(&t->grid, p0, p1); break;
+        case 'J': grid_erase_display(&t->grid, n > 0 ? params[0] : 0); break;
+        case 'K': grid_erase_line(&t->grid, n > 0 ? params[0] : 0); break;
+        case 'm': apply_sgr(&t->grid.currentAttr, params, n); break;
+        case 'h': case 'l': /* SM/RM without prefix — absorb silently */ break;
+        case 's': case 'u': /* save/restore cursor — TODO */ break;
+        case 'X': /* erase N chars */
+            for (int i = 0; i < p0 && t->grid.cursorCol + i < t->grid.cols; ++i)
+                t->grid.cells[t->grid.cursorRow * t->grid.cols + t->grid.cursorCol + i] = make_default_cell();
+            break;
+        case 'P': /* delete N chars */
+            for (int i = t->grid.cursorCol; i + p0 < t->grid.cols; ++i)
+                t->grid.cells[t->grid.cursorRow * t->grid.cols + i] = t->grid.cells[t->grid.cursorRow * t->grid.cols + i + p0];
+            break;
+        case '@': /* insert N blank chars */
+            for (int i = t->grid.cols - 1; i - p0 >= t->grid.cursorCol; --i)
+                t->grid.cells[t->grid.cursorRow * t->grid.cols + i] = t->grid.cells[t->grid.cursorRow * t->grid.cols + i - p0];
+            for (int i = 0; i < p0 && t->grid.cursorCol + i < t->grid.cols; ++i)
+                t->grid.cells[t->grid.cursorRow * t->grid.cols + t->grid.cursorCol + i] = make_default_cell();
+            break;
+        default: break;
+    }
+    t->grid.dirty = 1;
+}
+
+static void handle_osc(Tab* t) {
+    int code = -1;
+    const char* payload = t->parser.oscBuf;
+    int sep = -1;
+    for (int i = 0; i < t->parser.oscLen; ++i) if (t->parser.oscBuf[i] == ';') { sep = i; break; }
+    if (sep > 0) {
+        t->parser.oscBuf[sep] = 0;
+        code = atoi(t->parser.oscBuf);
+        payload = &t->parser.oscBuf[sep + 1];
+    }
+    if (code == 0 || code == 1 || code == 2) {
+        wchar_t title[128];
+        MultiByteToWideChar(CP_UTF8, 0, payload, -1, title, 128);
+        str_copy_w(t->title, 128, title);
+    } else if (code == 7) {
+        wchar_t cwd[MAX_PATH];
+        MultiByteToWideChar(CP_UTF8, 0, payload, -1, cwd, MAX_PATH);
+        if (wcsncmp(cwd, L"file://", 7) == 0) {
+            wchar_t* slash = wcschr(cwd + 7, L'/');
+            if (slash && slash[1] != 0 && slash[3] == L':') str_copy_w(t->session->cwd, MAX_PATH, slash + 1);
+            else if (slash) str_copy_w(t->session->cwd, MAX_PATH, slash);
+        } else {
+            str_copy_w(t->session->cwd, MAX_PATH, cwd);
+        }
+    }
+}
+
+static void parser_feed(Tab* t, const char* bytes, int n) {
+    AnsiParser* p = &t->parser;
+    for (int i = 0; i < n; ++i) {
+        unsigned char c = (unsigned char)bytes[i];
+
+        if (p->state == AP_OSC) {
+            if (c == 0x07 || c == 0x9C) { p->oscBuf[p->oscLen] = 0; handle_osc(t); p->state = AP_GROUND; p->oscLen = 0; }
+            else if (c == 0x1B) { /* maybe ST */ }
+            else if (p->oscLen < (int)sizeof(p->oscBuf) - 1) p->oscBuf[p->oscLen++] = (char)c;
+            continue;
+        }
+
+        switch (p->state) {
+            case AP_GROUND:
+                if (c < 0x20) {
+                    switch (c) {
+                        case 0x07: MessageBeep(MB_OK); break;
+                        case 0x08: grid_backspace(&t->grid); break;
+                        case 0x09: grid_tab_advance(&t->grid); break;
+                        case 0x0A: grid_line_feed(&t->grid); break;
+                        case 0x0D: grid_carriage_return(&t->grid); break;
+                        case 0x1B: p->state = AP_ESC; break;
+                        default: break;
+                    }
+                } else if (c < 0x80) {
+                    grid_put_char(&t->grid, (wchar_t)c);
+                } else {
+                    if ((c & 0xE0) == 0xC0) { p->utf8Code = c & 0x1F; p->utf8Remaining = 1; p->state = AP_UTF8; }
+                    else if ((c & 0xF0) == 0xE0) { p->utf8Code = c & 0x0F; p->utf8Remaining = 2; p->state = AP_UTF8; }
+                    else if ((c & 0xF8) == 0xF0) { p->utf8Code = c & 0x07; p->utf8Remaining = 3; p->state = AP_UTF8; }
+                }
+                break;
+            case AP_UTF8:
+                if ((c & 0xC0) == 0x80) {
+                    p->utf8Code = (p->utf8Code << 6) | (c & 0x3F);
+                    if (--p->utf8Remaining <= 0) {
+                        wchar_t wc = (p->utf8Code <= 0xFFFF) ? (wchar_t)p->utf8Code : L'?';
+                        grid_put_char(&t->grid, wc);
+                        p->state = AP_GROUND;
+                    }
+                } else { p->state = AP_GROUND; }
+                break;
+            case AP_ESC:
+                if (c == '[') { p->state = AP_CSI; p->paramLen = 0; }
+                else if (c == ']') { p->state = AP_OSC; p->oscLen = 0; }
+                else if (c == '\\') { p->state = AP_GROUND; }
+                else { p->state = AP_GROUND; }
+                break;
+            case AP_CSI:
+                /* Parameter bytes (0x30..0x3F) include digits, ';' AND the
+                 * private-mode prefixes '?', '>', '=', '<'. Without capturing
+                 * the prefix we'd bail out of the state machine and print
+                 * "25h", "25l", "1049h" etc as literals — which is exactly
+                 * what PowerShell sends for cursor visibility / alt-screen. */
+                if (c >= 0x30 && c <= 0x3F) {
+                    if (p->paramLen < (int)sizeof(p->paramBuf) - 1)
+                        p->paramBuf[p->paramLen++] = (char)c;
+                } else if (c >= 0x20 && c <= 0x2F) {
+                    /* intermediate — ignore */
+                } else if (c >= 0x40 && c <= 0x7E) {
+                    p->paramBuf[p->paramLen] = 0;
+                    handle_csi(t, (char)c);
+                    p->state = AP_GROUND;
+                    p->paramLen = 0;
+                } else {
+                    p->state = AP_GROUND;
+                }
+                break;
+            default: p->state = AP_GROUND; break;
+        }
+    }
+}
+
+/* =========================================================================
+ *                            CONPTY SESSION
+ * ========================================================================= */
+
+static BOOL load_conpty_apis(void) {
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    if (!k32) return FALSE;
+    pCreatePseudoConsole = (PFN_CreatePseudoConsole)GetProcAddress(k32, "CreatePseudoConsole");
+    pResizePseudoConsole = (PFN_ResizePseudoConsole)GetProcAddress(k32, "ResizePseudoConsole");
+    pClosePseudoConsole  = (PFN_ClosePseudoConsole)GetProcAddress(k32, "ClosePseudoConsole");
+    return pCreatePseudoConsole && pResizePseudoConsole && pClosePseudoConsole;
+}
+
+static void resolve_shell(const wchar_t* id, wchar_t* outCmd, size_t cap, wchar_t* outName, size_t nameCap) {
+    if (wcscmp(id, L"pwsh") == 0) {
+        wchar_t cand[MAX_PATH];
+        DWORD got = GetEnvironmentVariableW(L"ProgramFiles", cand, MAX_PATH);
+        if (got > 0) {
+            wcscat_s(cand, MAX_PATH, L"\\PowerShell\\7\\pwsh.exe");
+            if (GetFileAttributesW(cand) != INVALID_FILE_ATTRIBUTES) {
+                _snwprintf_s(outCmd, cap, _TRUNCATE, L"\"%s\" -NoLogo", cand);
+                str_copy_w(outName, nameCap, L"PowerShell 7");
+                return;
+            }
+        }
+        /* fall back to powershell */
+    }
+    if (wcscmp(id, L"cmd") == 0) {
+        wchar_t windir[MAX_PATH] = {0};
+        GetEnvironmentVariableW(L"WINDIR", windir, MAX_PATH);
+        _snwprintf_s(outCmd, cap, _TRUNCATE, L"%s\\System32\\cmd.exe", windir);
+        str_copy_w(outName, nameCap, L"Command Prompt");
+        return;
+    }
+    /* default: Windows PowerShell 5.1 */
+    wchar_t windir[MAX_PATH] = {0};
+    GetEnvironmentVariableW(L"WINDIR", windir, MAX_PATH);
+    _snwprintf_s(outCmd, cap, _TRUNCATE,
+                 L"%s\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoLogo",
+                 windir);
+    str_copy_w(outName, nameCap, L"Windows PowerShell");
+}
+
+static Session* session_create(const wchar_t* shellId, int cols, int rows) {
+    if (!pCreatePseudoConsole) return NULL;
+
+    Session* s = (Session*)xcalloc(1, sizeof(Session));
+
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, FALSE };
+    if (!CreatePipe(&s->hChildIn,  &s->hPipeIn,  &sa, 0)) goto fail;
+    if (!CreatePipe(&s->hPipeOut,  &s->hChildOut, &sa, 0)) goto fail;
+
+    COORD size; size.X = (SHORT)cols; size.Y = (SHORT)rows;
+    if (FAILED(pCreatePseudoConsole(size, s->hChildIn, s->hChildOut, 0, &s->hPC))) goto fail;
+
+    SIZE_T attrSize = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attrSize);
+    unsigned char* attrBuf = (unsigned char*)malloc(attrSize);
+    LPPROC_THREAD_ATTRIBUTE_LIST attrList = (LPPROC_THREAD_ATTRIBUTE_LIST)attrBuf;
+    if (!InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize)) goto fail;
+    UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                              s->hPC, sizeof(s->hPC), NULL, NULL);
+
+    STARTUPINFOEXW si = {0};
+    si.StartupInfo.cb = sizeof(STARTUPINFOEXW);
+    si.lpAttributeList = attrList;
+
+    wchar_t cmdLine[1024];
+    resolve_shell(shellId, cmdLine, 1024, s->shellName, 64);
+
+    PROCESS_INFORMATION pi = {0};
+    BOOL ok = CreateProcessW(NULL, cmdLine, NULL, NULL, FALSE,
+                              EXTENDED_STARTUPINFO_PRESENT,
+                              NULL, NULL, &si.StartupInfo, &pi);
+    DeleteProcThreadAttributeList(attrList);
+    free(attrBuf);
+
+    if (!ok) goto fail;
+
+    s->hProcess = pi.hProcess;
+    s->hThread  = pi.hThread;
+    s->pid      = pi.dwProcessId;
+    s->alive    = TRUE;
+
+    s->hJob = CreateJobObjectW(NULL, NULL);
+    if (s->hJob) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {0};
+        jeli.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+        SetInformationJobObject(s->hJob, JobObjectExtendedLimitInformation,
+                                &jeli, sizeof(jeli));
+        AssignProcessToJobObject(s->hJob, pi.hProcess);
+    }
+
+    s->hReaderThread = CreateThread(NULL, 0, reader_thread, s, 0, NULL);
+    return s;
+
+fail:
+    session_destroy(s);
+    return NULL;
+}
+
+static void session_destroy(Session* s) {
+    if (!s) return;
+    s->alive = FALSE;
+    /* Closing the pseudo console signals EOF on the child's stdin/stdout,
+     * which unblocks ReadFile in the reader thread on the next iteration. */
+    if (s->hPC && pClosePseudoConsole) pClosePseudoConsole(s->hPC);
+    if (s->hPipeIn  && s->hPipeIn  != INVALID_HANDLE_VALUE) CloseHandle(s->hPipeIn);
+    if (s->hChildIn && s->hChildIn != INVALID_HANDLE_VALUE) CloseHandle(s->hChildIn);
+    if (s->hChildOut&& s->hChildOut!= INVALID_HANDLE_VALUE) CloseHandle(s->hChildOut);
+    if (s->hPipeOut && s->hPipeOut != INVALID_HANDLE_VALUE) CloseHandle(s->hPipeOut);
+
+    /* Wait up to 5 s for the reader thread to drain. If it doesn't (rare —
+     * the child is misbehaving), DON'T free this struct: leak the few bytes
+     * rather than risk a use-after-free if the thread keeps reading.       */
+    BOOL threadDone = TRUE;
+    if (s->hReaderThread) {
+        if (WaitForSingleObject(s->hReaderThread, 5000) != WAIT_OBJECT_0) {
+            threadDone = FALSE;
+        }
+        CloseHandle(s->hReaderThread);
+    }
+    if (s->hJob)     CloseHandle(s->hJob);
+    if (s->hProcess) CloseHandle(s->hProcess);
+    if (s->hThread)  CloseHandle(s->hThread);
+    if (threadDone) free(s);
+    /* else: intentional leak — far safer than a use-after-free crash. */
+}
+
+static void session_resize(Session* s, int cols, int rows) {
+    if (!s || !s->hPC || !pResizePseudoConsole) return;
+    COORD cz = { (SHORT)cols, (SHORT)rows };
+    pResizePseudoConsole(s->hPC, cz);
+}
+
+static void session_write(Session* s, const void* data, int n) {
+    if (!s || !s->hPipeIn) return;
+    DWORD wrote = 0;
+    WriteFile(s->hPipeIn, data, (DWORD)n, &wrote, NULL);
+}
+
+#define WM_DANTE_OUTPUT (WM_APP + 1)
+
+/* Wire format: [int tabId][int nBytes][...nBytes of payload...] */
+static DWORD WINAPI reader_thread(LPVOID arg) {
+    Session* s = (Session*)arg;
+    char buf[16 * 1024];
+    while (s->alive) {
+        DWORD nr = 0;
+        BOOL ok = ReadFile(s->hPipeOut, buf, sizeof(buf), &nr, NULL);
+        if (!ok || nr == 0) break;
+
+        /* Allocate and post to UI thread so the ANSI parser runs there.
+         * We pass a stable tab id (int) — never a Session* — so the UI
+         * thread is safe even if the Session got freed in the meantime. */
+        int tabId = s->ownerTabId;
+        char* heap = (char*)malloc(nr + sizeof(int) * 2);
+        if (!heap) continue;
+        memcpy(heap, &tabId, sizeof(int));
+        int n = (int)nr;
+        memcpy(heap + sizeof(int), &n, sizeof(int));
+        memcpy(heap + sizeof(int) * 2, buf, nr);
+        if (!PostMessageW(g_app.hWnd, WM_DANTE_OUTPUT, 0, (LPARAM)heap)) {
+            /* Window gone — drop the buffer cleanly. */
+            free(heap);
+            break;
+        }
+    }
+    s->alive = FALSE;
+    return 0;
+}
+
+/* =========================================================================
+ *                          PERSISTENCE (JSON)
+ *
+ * State lives in %APPDATA%\Dante CLI\state.json. Schema is intentionally
+ * minimal — we hand-roll the writer (one record per line, indented) and a
+ * tiny tokeniser for the reader. No external deps.
+ * ========================================================================= */
+
+static void state_path(wchar_t* out, size_t cap) {
+    wchar_t base[MAX_PATH] = {0};
+    if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, base))) {
+        _snwprintf_s(out, cap, _TRUNCATE, L"%s\\Dante CLI", base);
+        CreateDirectoryW(out, NULL);
+        _snwprintf_s(out, cap, _TRUNCATE, L"%s\\Dante CLI\\state.json", base);
+    } else {
+        str_copy_w(out, cap, L"state.json");
+    }
+}
+
+static void json_escape(const wchar_t* in, wchar_t* out, size_t cap) {
+    size_t o = 0;
+    for (size_t i = 0; in[i] && o + 6 < cap; ++i) {
+        wchar_t c = in[i];
+        if (c == L'"' || c == L'\\') { out[o++] = L'\\'; out[o++] = c; }
+        else if (c == L'\n')          { out[o++] = L'\\'; out[o++] = L'n'; }
+        else if (c == L'\r')          { out[o++] = L'\\'; out[o++] = L'r'; }
+        else if (c == L'\t')          { out[o++] = L'\\'; out[o++] = L't'; }
+        else if (c < 0x20)            { o += swprintf(&out[o], cap - o, L"\\u%04x", c); }
+        else                          { out[o++] = c; }
+    }
+    out[o] = 0;
+}
+
+static int json_write_string(FILE* f, const wchar_t* s) {
+    wchar_t buf[2048];
+    json_escape(s, buf, 2048);
+    return fwprintf(f, L"\"%ls\"", buf);
+}
+
+static void persist_save(void) {
+    wchar_t path[MAX_PATH];
+    state_path(path, MAX_PATH);
+    FILE* f = NULL;
+    if (_wfopen_s(&f, path, L"w, ccs=UTF-8") != 0 || !f) return;
+
+    fwprintf(f, L"{\n");
+    fwprintf(f, L"  \"version\": 1,\n");
+    fwprintf(f, L"  \"sidebarMode\": %d,\n", (int)g_app.sidebarMode);
+    fwprintf(f, L"  \"scheme\": ");      json_write_string(f, kSchemes[clamp_int(g_schemeIdx, 0, SCHEME_COUNT - 1)].id); fwprintf(f, L",\n");
+    fwprintf(f, L"  \"groqApiKey\": ");  json_write_string(f, g_app.groqApiKey); fwprintf(f, L",\n");
+    fwprintf(f, L"  \"voiceLang\": ");   json_write_string(f, g_app.voiceLang); fwprintf(f, L",\n");
+    fwprintf(f, L"  \"fontPx\": %d,\n",  g_app.fontPxOverride);
+    fwprintf(f, L"  \"scrollback\": %d,\n", g_app.scrollbackLines);
+
+    fwprintf(f, L"  \"tabs\": [\n");
+    for (int i = 0; i < g_app.tabCount; ++i) {
+        Tab* t = g_app.tabs[i];
+        fwprintf(f, L"    {");
+        fwprintf(f, L"\"title\": ");      json_write_string(f, t->title);
+        fwprintf(f, L", \"emoji\": ");    json_write_string(f, t->emoji);
+        fwprintf(f, L", \"color\": %d",   t->colorIdx);
+        fwprintf(f, L", \"pinned\": %s",  t->pinned ? L"true" : L"false");
+        fwprintf(f, L", \"shell\": \"powershell\"");
+        fwprintf(f, L"}%ls\n", (i + 1 < g_app.tabCount) ? L"," : L"");
+    }
+    fwprintf(f, L"  ],\n");
+
+    fwprintf(f, L"  \"favorites\": [\n");
+    for (int i = 0; i < g_app.favoriteCount; ++i) {
+        Favorite* fv = &g_app.favorites[i];
+        fwprintf(f, L"    {\"name\": "); json_write_string(f, fv->name);
+        fwprintf(f, L", \"path\": ");    json_write_string(f, fv->path);
+        fwprintf(f, L", \"emoji\": ");   json_write_string(f, fv->emoji);
+        fwprintf(f, L"}%ls\n", (i + 1 < g_app.favoriteCount) ? L"," : L"");
+    }
+    fwprintf(f, L"  ],\n");
+
+    fwprintf(f, L"  \"snippets\": [\n");
+    for (int i = 0; i < g_app.snippetCount; ++i) {
+        Snippet* s = &g_app.snippets[i];
+        fwprintf(f, L"    {\"name\": "); json_write_string(f, s->name);
+        fwprintf(f, L", \"cmd\": ");     json_write_string(f, s->cmd);
+        fwprintf(f, L", \"emoji\": ");   json_write_string(f, s->emoji);
+        fwprintf(f, L"}%ls\n", (i + 1 < g_app.snippetCount) ? L"," : L"");
+    }
+    fwprintf(f, L"  ],\n");
+
+    fwprintf(f, L"  \"credentials\": [\n");
+    for (int i = 0; i < g_app.credCount; ++i) {
+        Credential* c = &g_app.creds[i];
+        fwprintf(f, L"    {\"name\": "); json_write_string(f, c->name);
+        fwprintf(f, L", \"kind\": ");    json_write_string(f, c->kind);
+        fwprintf(f, L", \"user\": ");    json_write_string(f, c->user);
+        fwprintf(f, L", \"host\": ");    json_write_string(f, c->host);
+        fwprintf(f, L", \"emoji\": ");   json_write_string(f, c->emoji);
+        fwprintf(f, L"}%ls\n", (i + 1 < g_app.credCount) ? L"," : L"");
+    }
+    fwprintf(f, L"  ]\n}\n");
+    fclose(f);
+}
+
+/* Tiny JSON reader — reads our own format. Looks for "key": "value" pairs
+ * inside the object scope corresponding to a given array name. Robust
+ * enough for state we wrote ourselves.                                  */
+static const wchar_t* skip_ws(const wchar_t* p) {
+    while (*p == L' ' || *p == L'\t' || *p == L'\n' || *p == L'\r') ++p;
+    return p;
+}
+
+static const wchar_t* read_json_string(const wchar_t* p, wchar_t* out, size_t cap) {
+    p = skip_ws(p);
+    if (*p != L'"') { if (cap) out[0] = 0; return p; }
+    ++p;
+    size_t o = 0;
+    while (*p && *p != L'"') {
+        if (*p == L'\\' && p[1]) {
+            wchar_t e = p[1];
+            wchar_t v = e;
+            if (e == L'n') v = L'\n';
+            else if (e == L'r') v = L'\r';
+            else if (e == L't') v = L'\t';
+            else if (e == L'u' && p[2] && p[3] && p[4] && p[5]) {
+                wchar_t hex[5] = {p[2], p[3], p[4], p[5], 0};
+                v = (wchar_t)wcstoul(hex, NULL, 16);
+                p += 4;
+            }
+            if (o + 1 < cap) out[o++] = v;
+            p += 2;
+        } else {
+            if (o + 1 < cap) out[o++] = *p;
+            ++p;
+        }
+    }
+    if (o < cap) out[o] = 0;
+    if (*p == L'"') ++p;
+    return p;
+}
+
+static const wchar_t* find_key(const wchar_t* p, const wchar_t* key) {
+    wchar_t needle[64];
+    _snwprintf_s(needle, 64, _TRUNCATE, L"\"%s\"", key);
+    const wchar_t* hit = wcsstr(p, needle);
+    if (!hit) return NULL;
+    hit = wcschr(hit, L':');
+    return hit ? hit + 1 : NULL;
+}
+
+static void parse_object_fields(const wchar_t* obj_start, const wchar_t* obj_end,
+                                 void* dest, const wchar_t** keys,
+                                 wchar_t** outs, int* caps, int nFields) {
+    for (int k = 0; k < nFields; ++k) {
+        wchar_t needle[64];
+        _snwprintf_s(needle, 64, _TRUNCATE, L"\"%s\"", keys[k]);
+        const wchar_t* hit = obj_start;
+        while (hit && hit < obj_end) {
+            const wchar_t* h = wcsstr(hit, needle);
+            if (!h || h >= obj_end) break;
+            const wchar_t* colon = wcschr(h, L':');
+            if (!colon || colon >= obj_end) break;
+            read_json_string(colon + 1, outs[k], caps[k]);
+            break;
+        }
+        if (outs[k] == NULL) {}
+    }
+    UNUSED(dest);
+}
+
+static void parse_array_objects(const wchar_t* json, const wchar_t* arr_key,
+                                 void (*on_obj)(const wchar_t* obj_start, const wchar_t* obj_end)) {
+    const wchar_t* p = find_key(json, arr_key);
+    if (!p) return;
+    p = skip_ws(p);
+    if (*p != L'[') return;
+    ++p;
+    while (*p) {
+        p = skip_ws(p);
+        if (*p == L']') return;
+        if (*p == L'{') {
+            const wchar_t* start = p;
+            int depth = 1;
+            ++p;
+            while (*p && depth > 0) {
+                if (*p == L'"') { /* skip string */
+                    ++p;
+                    while (*p && *p != L'"') { if (*p == L'\\' && p[1]) ++p; ++p; }
+                    if (*p) ++p;
+                    continue;
+                }
+                if (*p == L'{') depth++;
+                else if (*p == L'}') depth--;
+                if (depth > 0) ++p;
+            }
+            const wchar_t* end = p;
+            on_obj(start, end);
+            if (*p == L'}') ++p;
+        }
+        p = skip_ws(p);
+        if (*p == L',') ++p;
+        else if (*p == L']') return;
+        else ++p;
+    }
+}
+
+static void on_tab_object(const wchar_t* s, const wchar_t* e) {
+    if (g_app.tabCount >= MAX_TABS) return;
+    wchar_t title[128] = L"Terminal";
+    wchar_t emoji[8]   = L"\U0001F4BB";
+    wchar_t colorStr[16] = L"0";
+    wchar_t pinned[8] = L"false";
+
+    wchar_t* outs[] = { title, emoji, colorStr, pinned };
+    int caps[] = { 128, 8, 16, 8 };
+    const wchar_t* keys[] = { L"title", L"emoji", L"color", L"pinned" };
+
+    parse_object_fields(s, e, NULL, keys, outs, caps, 4);
+
+    /* `color` and `pinned` are NOT strings — re-extract them as raw tokens. */
+    const wchar_t* c = wcsstr(s, L"\"color\"");
+    int colorIdx = 0;
+    if (c && c < e) {
+        c = wcschr(c, L':');
+        if (c && c < e) { c++; while (*c == L' ') ++c; colorIdx = _wtoi(c); }
+    }
+    const wchar_t* pi = wcsstr(s, L"\"pinned\"");
+    BOOL isPinned = FALSE;
+    if (pi && pi < e) {
+        pi = wcschr(pi, L':');
+        if (pi && pi < e) isPinned = (wcsstr(pi, L"true") != NULL && wcsstr(pi, L"true") < e);
+    }
+
+    Tab* t = (Tab*)xcalloc(1, sizeof(Tab));
+    t->id = next_tab_id++;
+    str_copy_w(t->title, 128, title);
+    str_copy_w(t->emoji, 8, emoji);
+    t->colorIdx = clamp_int(colorIdx, 0, 11);
+    t->pinned = isPinned;
+    terminal_grid_init(&t->grid, 120, 30);
+    parser_init(&t->parser);
+    t->session = session_create(L"powershell", 120, 30);
+    if (t->session) t->session->ownerTabId = t->id;
+    g_app.tabs[g_app.tabCount++] = t;
+}
+
+static void on_favorite_object(const wchar_t* s, const wchar_t* e) {
+    if (g_app.favoriteCount >= MAX_FAVORITES) return;
+    Favorite* fv = &g_app.favorites[g_app.favoriteCount];
+    memset(fv, 0, sizeof(*fv));
+    wchar_t* outs[] = { fv->name, fv->path, fv->emoji };
+    int caps[] = { 128, MAX_PATH, 8 };
+    const wchar_t* keys[] = { L"name", L"path", L"emoji" };
+    parse_object_fields(s, e, NULL, keys, outs, caps, 3);
+    if (fv->name[0] || fv->path[0]) g_app.favoriteCount++;
+}
+
+static void on_snippet_object(const wchar_t* s, const wchar_t* e) {
+    if (g_app.snippetCount >= MAX_SNIPPETS) return;
+    Snippet* sn = &g_app.snippets[g_app.snippetCount];
+    memset(sn, 0, sizeof(*sn));
+    wchar_t* outs[] = { sn->name, sn->cmd, sn->emoji };
+    int caps[] = { 128, 512, 8 };
+    const wchar_t* keys[] = { L"name", L"cmd", L"emoji" };
+    parse_object_fields(s, e, NULL, keys, outs, caps, 3);
+    if (sn->name[0] || sn->cmd[0]) g_app.snippetCount++;
+}
+
+static void on_credential_object(const wchar_t* s, const wchar_t* e) {
+    if (g_app.credCount >= MAX_CREDS) return;
+    Credential* c = &g_app.creds[g_app.credCount];
+    memset(c, 0, sizeof(*c));
+    wchar_t* outs[] = { c->name, c->kind, c->user, c->host, c->emoji };
+    int caps[] = { 128, 16, 64, 128, 8 };
+    const wchar_t* keys[] = { L"name", L"kind", L"user", L"host", L"emoji" };
+    parse_object_fields(s, e, NULL, keys, outs, caps, 5);
+    if (c->name[0]) g_app.credCount++;
+}
+
+static void persist_load(void) {
+    wchar_t path[MAX_PATH];
+    state_path(path, MAX_PATH);
+    FILE* f = NULL;
+    if (_wfopen_s(&f, path, L"r, ccs=UTF-8") != 0 || !f) return;
+
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz <= 0 || sz > 1024 * 1024) { fclose(f); return; }
+
+    wchar_t* buf = (wchar_t*)xcalloc((size_t)sz + 2, sizeof(wchar_t));
+    size_t n = fread(buf, sizeof(wchar_t), (size_t)sz, f);
+    buf[n] = 0;
+    fclose(f);
+
+    /* sidebarMode */
+    const wchar_t* sm = find_key(buf, L"sidebarMode");
+    if (sm) {
+        sm = skip_ws(sm);
+        g_app.sidebarMode = (SidebarMode)clamp_int(_wtoi(sm), 0, MODE_COUNT - 1);
+    }
+
+    /* scheme */
+    const wchar_t* sch = find_key(buf, L"scheme");
+    if (sch) {
+        wchar_t id[64] = {0};
+        read_json_string(sch, id, 64);
+        for (int i = 0; i < SCHEME_COUNT; ++i) {
+            if (wcscmp(kSchemes[i].id, id) == 0) { g_schemeIdx = i; break; }
+        }
+    }
+    /* api key + voice lang + font + scrollback */
+    const wchar_t* gk = find_key(buf, L"groqApiKey");
+    if (gk) read_json_string(gk, g_app.groqApiKey, 128);
+    const wchar_t* vl = find_key(buf, L"voiceLang");
+    if (vl) read_json_string(vl, g_app.voiceLang, 16);
+    const wchar_t* fp = find_key(buf, L"fontPx");
+    if (fp) { fp = skip_ws(fp); g_app.fontPxOverride = _wtoi(fp); }
+    const wchar_t* sbk = find_key(buf, L"scrollback");
+    if (sbk) { sbk = skip_ws(sbk); g_app.scrollbackLines = _wtoi(sbk); }
+
+    /* Arrays */
+    parse_array_objects(buf, L"favorites",   on_favorite_object);
+    parse_array_objects(buf, L"snippets",    on_snippet_object);
+    parse_array_objects(buf, L"credentials", on_credential_object);
+    parse_array_objects(buf, L"tabs",        on_tab_object);
+
+    free(buf);
+}
+
+static void schedule_persist(void) {
+    g_app.pendingPersist = 1;
+}
+
+/* =========================================================================
+ *                       SIMPLE PROMPT DIALOGS
+ * ========================================================================= */
+
+typedef struct {
+    const wchar_t* title;
+    const wchar_t* prompt;
+    wchar_t* out;
+    int outCap;
+    HWND hEdit;
+    HWND hOK;
+    HWND hCancel;
+    BOOL submitted;
+} PromptCtx;
+
+static PromptCtx* g_promptCtx = NULL;
+
+static LRESULT CALLBACK PromptWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE: {
+            HFONT f = g_app.hFontUI;
+
+            HWND lbl = CreateWindowExW(0, L"STATIC", g_promptCtx->prompt,
+                WS_CHILD | WS_VISIBLE, 16, 14, 380, 36,
+                hWnd, NULL, GetModuleHandleW(NULL), NULL);
+            SendMessageW(lbl, WM_SETFONT, (WPARAM)f, TRUE);
+
+            g_promptCtx->hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+                16, 58, 380, 28, hWnd, (HMENU)100, GetModuleHandleW(NULL), NULL);
+            SendMessageW(g_promptCtx->hEdit, WM_SETFONT, (WPARAM)f, TRUE);
+
+            g_promptCtx->hOK = CreateWindowExW(0, L"BUTTON", L"OK",
+                WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+                212, 100, 90, 28, hWnd, (HMENU)IDOK, GetModuleHandleW(NULL), NULL);
+            SendMessageW(g_promptCtx->hOK, WM_SETFONT, (WPARAM)f, TRUE);
+
+            g_promptCtx->hCancel = CreateWindowExW(0, L"BUTTON", L"Cancelar",
+                WS_CHILD | WS_VISIBLE,
+                306, 100, 90, 28, hWnd, (HMENU)IDCANCEL, GetModuleHandleW(NULL), NULL);
+            SendMessageW(g_promptCtx->hCancel, WM_SETFONT, (WPARAM)f, TRUE);
+
+            SetFocus(g_promptCtx->hEdit);
+            return 0;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wParam) == IDOK) {
+                GetWindowTextW(g_promptCtx->hEdit, g_promptCtx->out, g_promptCtx->outCap);
+                g_promptCtx->submitted = TRUE;
+                DestroyWindow(hWnd);
+            } else if (LOWORD(wParam) == IDCANCEL) {
+                g_promptCtx->submitted = FALSE;
+                DestroyWindow(hWnd);
+            }
+            return 0;
+        case WM_CLOSE:
+            g_promptCtx->submitted = FALSE;
+            DestroyWindow(hWnd);
+            return 0;
+        case WM_DESTROY:
+            /* Wake the modal GetMessage loop without injecting WM_QUIT — that
+             * would also terminate the main app loop (the bug that closed the
+             * whole app when the user clicked Save in Settings). Posting a
+             * NULL message via thread-message is enough.                    */
+            PostThreadMessageW(GetCurrentThreadId(), WM_NULL, 0, 0);
+            return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+static BOOL prompt_text(const wchar_t* title, const wchar_t* prompt, wchar_t* out, int outCap) {
+    PromptCtx ctx = { title, prompt, out, outCap, NULL, NULL, NULL, FALSE };
+    g_promptCtx = &ctx;
+
+    static BOOL registered = FALSE;
+    if (!registered) {
+        WNDCLASSEXW wc = { sizeof(wc) };
+        wc.lpfnWndProc = PromptWndProc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"DantePromptDlg";
+        RegisterClassExW(&wc);
+        registered = TRUE;
+    }
+
+    RECT pr; GetWindowRect(g_app.hWnd, &pr);
+    int W = 420, H = 170;
+    int x = pr.left + ((pr.right - pr.left) - W) / 2;
+    int y = pr.top  + ((pr.bottom - pr.top) - H) / 2;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        L"DantePromptDlg", title,
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        x, y, W, H, g_app.hWnd, NULL, GetModuleHandleW(NULL), NULL);
+    ShowWindow(dlg, SW_SHOW);
+    EnableWindow(g_app.hWnd, FALSE);
+
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        if (!IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (!IsWindow(dlg)) break;
+    }
+
+    EnableWindow(g_app.hWnd, TRUE);
+    SetForegroundWindow(g_app.hWnd);
+    g_promptCtx = NULL;
+    return ctx.submitted && out[0] != 0;
+}
+
+/* =========================================================================
+ *                       SETTINGS DIALOG
+ *
+ * Modal popup window with 3 sections: Appearance (scheme + font size),
+ * Voice & AI (Groq API key, voice language), General (scrollback).
+ * ========================================================================= */
+
+typedef struct {
+    HWND hScheme;
+    HWND hFontSize;
+    HWND hGroqKey;
+    HWND hVoiceLang;
+    HWND hScrollback;
+    HWND hOK;
+    HWND hCancel;
+} SettingsCtx;
+
+static SettingsCtx* g_settingsCtx = NULL;
+
+static LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE: {
+            HFONT f = g_app.hFontUI;
+            int y = 18;
+
+            CreateWindowExW(0, L"STATIC", L"Tema do terminal:",
+                WS_CHILD | WS_VISIBLE, 18, y, 200, 22, hWnd, NULL,
+                GetModuleHandleW(NULL), NULL);
+            g_settingsCtx->hScheme = CreateWindowExW(0, L"COMBOBOX", NULL,
+                WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+                220, y - 2, 220, 200, hWnd, (HMENU)201,
+                GetModuleHandleW(NULL), NULL);
+            for (int i = 0; i < SCHEME_COUNT; ++i) {
+                SendMessageW(g_settingsCtx->hScheme, CB_ADDSTRING, 0, (LPARAM)kSchemes[i].displayName);
+            }
+            SendMessageW(g_settingsCtx->hScheme, CB_SETCURSEL, g_schemeIdx, 0);
+            y += 36;
+
+            CreateWindowExW(0, L"STATIC", L"Tamanho da fonte (9-28pt, 0=padrão):",
+                WS_CHILD | WS_VISIBLE, 18, y, 240, 22, hWnd, NULL,
+                GetModuleHandleW(NULL), NULL);
+            wchar_t fs[16];
+            _snwprintf_s(fs, 16, _TRUNCATE, L"%d", g_app.fontPxOverride);
+            g_settingsCtx->hFontSize = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", fs,
+                WS_CHILD | WS_VISIBLE | ES_NUMBER,
+                280, y - 2, 80, 26, hWnd, (HMENU)202,
+                GetModuleHandleW(NULL), NULL);
+            y += 36;
+
+            CreateWindowExW(0, L"STATIC", L"Scrollback (linhas):",
+                WS_CHILD | WS_VISIBLE, 18, y, 200, 22, hWnd, NULL,
+                GetModuleHandleW(NULL), NULL);
+            wchar_t sb[16];
+            _snwprintf_s(sb, 16, _TRUNCATE, L"%d",
+                         g_app.scrollbackLines > 0 ? g_app.scrollbackLines : 5000);
+            g_settingsCtx->hScrollback = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", sb,
+                WS_CHILD | WS_VISIBLE | ES_NUMBER,
+                220, y - 2, 120, 26, hWnd, (HMENU)203,
+                GetModuleHandleW(NULL), NULL);
+            y += 50;
+
+            CreateWindowExW(0, L"STATIC", L"───  Voz & IA  ─────────────────────",
+                WS_CHILD | WS_VISIBLE, 18, y, 450, 22, hWnd, NULL,
+                GetModuleHandleW(NULL), NULL);
+            y += 30;
+
+            CreateWindowExW(0, L"STATIC", L"Groq API key (https://console.groq.com/keys):",
+                WS_CHILD | WS_VISIBLE, 18, y, 460, 22, hWnd, NULL,
+                GetModuleHandleW(NULL), NULL);
+            y += 24;
+            g_settingsCtx->hGroqKey = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", g_app.groqApiKey,
+                WS_CHILD | WS_VISIBLE | ES_PASSWORD | ES_AUTOHSCROLL,
+                18, y, 460, 28, hWnd, (HMENU)204,
+                GetModuleHandleW(NULL), NULL);
+            y += 38;
+
+            CreateWindowExW(0, L"STATIC", L"Idioma da transcrição de voz (pt, en):",
+                WS_CHILD | WS_VISIBLE, 18, y, 280, 22, hWnd, NULL,
+                GetModuleHandleW(NULL), NULL);
+            const wchar_t* vlang = g_app.voiceLang[0] ? g_app.voiceLang : L"pt";
+            g_settingsCtx->hVoiceLang = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", vlang,
+                WS_CHILD | WS_VISIBLE,
+                300, y - 2, 80, 26, hWnd, (HMENU)205,
+                GetModuleHandleW(NULL), NULL);
+            y += 48;
+
+            g_settingsCtx->hOK = CreateWindowExW(0, L"BUTTON", L"Salvar",
+                WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+                280, y, 90, 30, hWnd, (HMENU)IDOK,
+                GetModuleHandleW(NULL), NULL);
+            g_settingsCtx->hCancel = CreateWindowExW(0, L"BUTTON", L"Cancelar",
+                WS_CHILD | WS_VISIBLE,
+                380, y, 90, 30, hWnd, (HMENU)IDCANCEL,
+                GetModuleHandleW(NULL), NULL);
+
+            SendMessageW(g_settingsCtx->hScheme,     WM_SETFONT, (WPARAM)f, TRUE);
+            SendMessageW(g_settingsCtx->hFontSize,   WM_SETFONT, (WPARAM)f, TRUE);
+            SendMessageW(g_settingsCtx->hScrollback, WM_SETFONT, (WPARAM)f, TRUE);
+            SendMessageW(g_settingsCtx->hGroqKey,    WM_SETFONT, (WPARAM)f, TRUE);
+            SendMessageW(g_settingsCtx->hVoiceLang,  WM_SETFONT, (WPARAM)f, TRUE);
+            SendMessageW(g_settingsCtx->hOK,         WM_SETFONT, (WPARAM)f, TRUE);
+            SendMessageW(g_settingsCtx->hCancel,     WM_SETFONT, (WPARAM)f, TRUE);
+            return 0;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wParam) == IDOK) {
+                int newScheme = (int)SendMessageW(g_settingsCtx->hScheme, CB_GETCURSEL, 0, 0);
+                if (newScheme >= 0 && newScheme < SCHEME_COUNT) g_schemeIdx = newScheme;
+                wchar_t buf[64];
+                GetWindowTextW(g_settingsCtx->hFontSize, buf, 64);
+                g_app.fontPxOverride = clamp_int(_wtoi(buf), 0, 48);
+                GetWindowTextW(g_settingsCtx->hScrollback, buf, 64);
+                int sb = _wtoi(buf);
+                if (sb > 0) g_app.scrollbackLines = sb;
+                GetWindowTextW(g_settingsCtx->hGroqKey, g_app.groqApiKey, 128);
+                GetWindowTextW(g_settingsCtx->hVoiceLang, g_app.voiceLang, 16);
+                /* Force-flush to disk now — the debounced timer (1.5 s) was
+                 * losing the change because the user could close the app or
+                 * something could race the timer. The API key must be safe
+                 * the moment the user clicks Save.                        */
+                g_app.pendingPersist = 0;
+                persist_save();
+                InvalidateRect(g_app.hWnd, NULL, FALSE);
+                DestroyWindow(hWnd);
+            } else if (LOWORD(wParam) == IDCANCEL) {
+                DestroyWindow(hWnd);
+            }
+            return 0;
+        case WM_CLOSE:    DestroyWindow(hWnd); return 0;
+        case WM_DESTROY:
+            /* Same fix as the prompt dialog — do NOT PostQuitMessage, that
+             * would kill the entire app right after the user clicks Save. */
+            PostThreadMessageW(GetCurrentThreadId(), WM_NULL, 0, 0);
+            return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+static void show_settings_dialog(void) {
+    static BOOL registered = FALSE;
+    if (!registered) {
+        WNDCLASSEXW wc = { sizeof(wc) };
+        wc.lpfnWndProc = SettingsWndProc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"DanteSettingsDlg";
+        RegisterClassExW(&wc);
+        registered = TRUE;
+    }
+
+    SettingsCtx ctx = {0};
+    g_settingsCtx = &ctx;
+
+    RECT pr; GetWindowRect(g_app.hWnd, &pr);
+    int W = 520, H = 430;
+    int x = pr.left + ((pr.right - pr.left) - W) / 2;
+    int y = pr.top  + ((pr.bottom - pr.top) - H) / 2;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        L"DanteSettingsDlg", L"Configurações — Dante CLI",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        x, y, W, H, g_app.hWnd, NULL, GetModuleHandleW(NULL), NULL);
+    ShowWindow(dlg, SW_SHOW);
+    EnableWindow(g_app.hWnd, FALSE);
+
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        if (!IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (!IsWindow(dlg)) break;
+    }
+    EnableWindow(g_app.hWnd, TRUE);
+    SetForegroundWindow(g_app.hWnd);
+    g_settingsCtx = NULL;
+}
+
+static void show_add_dialog(void) {
+    wchar_t name[128]  = {0};
+    wchar_t value[512] = {0};
+
+    switch (g_app.sidebarMode) {
+        case MODE_FAVORITES: {
+            if (!prompt_text(L"Novo favorito",
+                L"Nome (ex: \"Projeto X\"):", name, 128)) return;
+            if (!prompt_text(L"Novo favorito",
+                L"Caminho da pasta (ex: C:\\Users\\eu\\proj):", value, 512)) return;
+            if (g_app.favoriteCount >= MAX_FAVORITES) return;
+            Favorite* fv = &g_app.favorites[g_app.favoriteCount++];
+            memset(fv, 0, sizeof(*fv));
+            str_copy_w(fv->name, 128, name);
+            str_copy_w(fv->path, MAX_PATH, value);
+            str_copy_w(fv->emoji, 8, L"\U0001F4C2");
+            break;
+        }
+        case MODE_SNIPPETS: {
+            if (!prompt_text(L"Novo snippet",
+                L"Nome (ex: \"Listar containers\"):", name, 128)) return;
+            if (!prompt_text(L"Novo snippet",
+                L"Comando a injetar (ex: docker ps -a):", value, 512)) return;
+            if (g_app.snippetCount >= MAX_SNIPPETS) return;
+            Snippet* sn = &g_app.snippets[g_app.snippetCount++];
+            memset(sn, 0, sizeof(*sn));
+            str_copy_w(sn->name, 128, name);
+            str_copy_w(sn->cmd, 512, value);
+            str_copy_w(sn->emoji, 8, L"⚡");
+            break;
+        }
+        case MODE_CREDS: {
+            if (!prompt_text(L"Nova credencial",
+                L"Nome (ex: \"Servidor prod\"):", name, 128)) return;
+            if (!prompt_text(L"Nova credencial",
+                L"Tipo (ssh, ftp, api, custom):", value, 64)) return;
+            wchar_t user[64] = {0}, host[128] = {0};
+            prompt_text(L"Nova credencial", L"Usuário (opcional):", user, 64);
+            prompt_text(L"Nova credencial", L"Host (opcional):", host, 128);
+            if (g_app.credCount >= MAX_CREDS) return;
+            Credential* c = &g_app.creds[g_app.credCount++];
+            memset(c, 0, sizeof(*c));
+            str_copy_w(c->name, 128, name);
+            str_copy_w(c->kind, 16, value);
+            str_copy_w(c->user, 64, user);
+            str_copy_w(c->host, 128, host);
+            str_copy_w(c->emoji, 8, L"\U0001F511");
+            break;
+        }
+        case MODE_FILES:
+        default:
+            MessageBoxW(g_app.hWnd,
+                L"Use Favoritos para guardar pastas frequentes.",
+                APP_NAME_W, MB_ICONINFORMATION);
+            return;
+    }
+    schedule_persist();
+    InvalidateRect(g_app.hWnd, NULL, FALSE);
+}
+
+/* =========================================================================
+ *                          TAB CONTEXT MENU
+ * ========================================================================= */
+
+enum {
+    IDM_TAB_RENAME = 0x1100,
+    IDM_TAB_DUPLICATE,
+    IDM_TAB_PIN,
+    IDM_TAB_CLOSE,
+    IDM_TAB_CLOSE_OTHERS,
+    IDM_TAB_NEW_PWSH7,
+    IDM_TAB_NEW_CMD,
+    IDM_TAB_COLOR_BASE = 0x1200,    /* +0..11 */
+};
+
+static void duplicate_tab(int idx) {
+    if (idx < 0 || idx >= g_app.tabCount || g_app.tabCount >= MAX_TABS) return;
+    Tab* src = g_app.tabs[idx];
+    open_new_tab(L"powershell");
+    Tab* nt = g_app.tabs[g_app.tabCount - 1];
+    str_copy_w(nt->title, 128, src->title);
+    str_copy_w(nt->emoji, 8, src->emoji);
+    nt->colorIdx = src->colorIdx;
+    schedule_persist();
+}
+
+static void show_tab_context_menu(HWND hWnd, int tabIdx, int x, int y) {
+    if (tabIdx < 0 || tabIdx >= g_app.tabCount) return;
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING, IDM_TAB_RENAME, L"Renomear...");
+    AppendMenuW(m, MF_STRING, IDM_TAB_DUPLICATE, L"Duplicar");
+    AppendMenuW(m, MF_STRING | (g_app.tabs[tabIdx]->pinned ? MF_CHECKED : 0),
+                IDM_TAB_PIN, L"Fixar");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+
+    HMENU colors = CreatePopupMenu();
+    static const wchar_t* names[12] = {
+        L"Neutro", L"Vermelho", L"Laranja", L"Amarelo", L"Verde", L"Menta",
+        L"Ciano", L"Azul", L"Índigo", L"Roxo", L"Pink", L"Marrom"
+    };
+    for (int i = 0; i < 12; ++i) {
+        AppendMenuW(colors, MF_STRING | (g_app.tabs[tabIdx]->colorIdx == i ? MF_CHECKED : 0),
+                    IDM_TAB_COLOR_BASE + i, names[i]);
+    }
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)colors, L"Cor");
+
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, IDM_TAB_NEW_PWSH7, L"Nova aba (PowerShell 7)");
+    AppendMenuW(m, MF_STRING, IDM_TAB_NEW_CMD,   L"Nova aba (cmd.exe)");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, IDM_TAB_CLOSE,        L"Fechar");
+    AppendMenuW(m, MF_STRING, IDM_TAB_CLOSE_OTHERS, L"Fechar outras");
+
+    POINT pt = { x, y };
+    ClientToScreen(hWnd, &pt);
+
+    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+                              pt.x, pt.y, 0, hWnd, NULL);
+    DestroyMenu(m);
+
+    if (cmd == IDM_TAB_RENAME) {
+        wchar_t newName[128] = {0};
+        str_copy_w(newName, 128, g_app.tabs[tabIdx]->title);
+        if (prompt_text(L"Renomear aba", L"Novo título:", newName, 128)) {
+            str_copy_w(g_app.tabs[tabIdx]->title, 128, newName);
+            schedule_persist();
+        }
+    } else if (cmd == IDM_TAB_DUPLICATE) {
+        duplicate_tab(tabIdx);
+    } else if (cmd == IDM_TAB_PIN) {
+        g_app.tabs[tabIdx]->pinned = !g_app.tabs[tabIdx]->pinned;
+        schedule_persist();
+    } else if (cmd == IDM_TAB_CLOSE) {
+        close_tab(tabIdx);
+    } else if (cmd == IDM_TAB_CLOSE_OTHERS) {
+        /* close from the end so indices stay valid */
+        for (int i = g_app.tabCount - 1; i >= 0; --i) if (i != tabIdx) close_tab(i);
+    } else if (cmd == IDM_TAB_NEW_PWSH7) {
+        open_new_tab(L"pwsh");
+    } else if (cmd == IDM_TAB_NEW_CMD) {
+        open_new_tab(L"cmd");
+    } else if (cmd >= IDM_TAB_COLOR_BASE && cmd < IDM_TAB_COLOR_BASE + 12) {
+        g_app.tabs[tabIdx]->colorIdx = cmd - IDM_TAB_COLOR_BASE;
+        schedule_persist();
+    }
+
+    InvalidateRect(hWnd, NULL, FALSE);
+}
+
+/* =========================================================================
+ *                       ABOUT / UPDATE CHECK
+ * ========================================================================= */
+
+static void show_about(void) {
+    wchar_t msg[1024];
+    _snwprintf_s(msg, 1024, _TRUNCATE,
+        L"Dante CLI %s\n\n"
+        L"Terminal nativo para Windows.\n\n"
+        L"Recursos:\n"
+        L"  · ConPTY + parser ANSI próprio (cores 16/256/truecolor)\n"
+        L"  · 19 esquemas de cor (Tokyo Night, Dracula, Nord, …)\n"
+        L"  · Sidebar com Favoritos, Snippets, Credenciais persistidos\n"
+        L"  · Split workspace (5 layouts) com foco por célula\n"
+        L"  · Integração Groq Chat (Explicar) + Groq Whisper (Voz)\n"
+        L"  · 100%% Win32, zero dependências externas, 340 KB\n\n"
+        L"© 2026 Dante · MIT License\n"
+        L"Pressione Ctrl+/ para ver atalhos.",
+        APP_VERSION_W);
+    MessageBoxW(g_app.hWnd, msg, L"Sobre o Dante CLI", MB_ICONINFORMATION | MB_OK);
+}
+
+#define WM_DANTE_UPDATE_RESULT (WM_APP + 6)
+
+typedef struct { char* url; wchar_t* version; } UpdateInfo;
+
+static DWORD WINAPI update_check_thread(LPVOID arg) {
+    (void)arg;
+    HINTERNET hSes = WinHttpOpen(L"DanteCLI/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
+    if (!hSes) return 0;
+    HINTERNET hCon = WinHttpConnect(hSes, L"raw.githubusercontent.com",
+                                     INTERNET_DEFAULT_HTTPS_PORT, 0);
+    if (!hCon) { WinHttpCloseHandle(hSes); return 0; }
+    HINTERNET hReq = WinHttpOpenRequest(hCon, L"GET",
+        L"/dantetesta/dante-cli/main/updates/win.json",
+        NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+        WINHTTP_FLAG_SECURE);
+    if (!hReq) { WinHttpCloseHandle(hCon); WinHttpCloseHandle(hSes); return 0; }
+    if (!WinHttpSendRequest(hReq, NULL, 0, NULL, 0, 0, 0)) {
+        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hCon); WinHttpCloseHandle(hSes);
+        return 0;
+    }
+    if (!WinHttpReceiveResponse(hReq, NULL)) {
+        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hCon); WinHttpCloseHandle(hSes);
+        return 0;
+    }
+
+    char buf[4096]; DWORD avail = 0, total = 0;
+    while (WinHttpQueryDataAvailable(hReq, &avail) && avail > 0 && total < 3500) {
+        DWORD got = 0;
+        WinHttpReadData(hReq, buf + total, avail, &got);
+        total += got;
+    }
+    buf[total] = 0;
+    WinHttpCloseHandle(hReq); WinHttpCloseHandle(hCon); WinHttpCloseHandle(hSes);
+
+    /* Parse {"version":"x.y.z","url":"..."} */
+    const char* vk = strstr(buf, "\"version\"");
+    if (vk) {
+        vk = strchr(vk, ':');
+        if (vk) {
+            vk++;
+            while (*vk == ' ' || *vk == '"') vk++;
+            char ver[32] = {0}; int i = 0;
+            while (*vk && *vk != '"' && i < 31) ver[i++] = *vk++;
+            wchar_t* w = utf8_to_w_dup(ver, -1);
+            PostMessageW(g_app.hWnd, WM_DANTE_UPDATE_RESULT, 0, (LPARAM)w);
+        }
+    }
+    return 0;
+}
+
+static void check_for_updates_async(void) {
+    HANDLE h = CreateThread(NULL, 0, update_check_thread, NULL, 0, NULL);
+    if (h) CloseHandle(h);
+}
+
+/* =========================================================================
+ *                       SPLIT WORKSPACE
+ * ========================================================================= */
+
+static void set_split_layout(int presetIdx) {
+    if (presetIdx < 0 || presetIdx >= PRESET_COUNT) return;
+    g_app.splitLayout = presetIdx;
+    g_app.splitActiveCell = 0;
+    int cells = kPresets[presetIdx].cellCount;
+    /* Auto-fill slots with the first N tabs */
+    for (int i = 0; i < MAX_SPLIT_CELLS; ++i) g_app.splitSlots[i] = -1;
+    for (int i = 0; i < cells && i < g_app.tabCount; ++i) g_app.splitSlots[i] = i;
+    InvalidateRect(g_app.hWnd, NULL, FALSE);
+    update_status();
+}
+
+enum {
+    IDM_SPLIT_BASE = 0x1300,   /* +0..PRESET_COUNT-1 */
+};
+
+/* Build a categorised popup: each category is a submenu, presets inside it
+ * are sorted by their position in kPresets[]. */
+static void show_split_menu(HWND hWnd, int x, int y) {
+    HMENU root = CreatePopupMenu();
+
+    /* "Sem split" goes to the top level for quick access. */
+    AppendMenuW(root, MF_STRING | (g_app.splitLayout == PRESET_SINGLE ? MF_CHECKED : 0),
+                IDM_SPLIT_BASE + PRESET_SINGLE, kPresets[PRESET_SINGLE].name);
+    AppendMenuW(root, MF_SEPARATOR, 0, NULL);
+
+    for (int cat = 0; cat < SCAT_COUNT; ++cat) {
+        HMENU sub = CreatePopupMenu();
+        int hasItems = 0;
+        for (int i = 0; i < PRESET_COUNT; ++i) {
+            if (i == PRESET_SINGLE) continue;
+            if (kPresets[i].category != cat) continue;
+            wchar_t label[160];
+            _snwprintf_s(label, 160, _TRUNCATE, L"%s   (%d painéis)",
+                         kPresets[i].name, kPresets[i].cellCount);
+            AppendMenuW(sub, MF_STRING | (g_app.splitLayout == i ? MF_CHECKED : 0),
+                        IDM_SPLIT_BASE + i, label);
+            hasItems = 1;
+        }
+        if (hasItems) {
+            AppendMenuW(root, MF_POPUP, (UINT_PTR)sub, kSplitCategoryNames[cat]);
+        } else {
+            DestroyMenu(sub);
+        }
+    }
+
+    POINT pt = { x, y };
+    ClientToScreen(hWnd, &pt);
+    int cmd = TrackPopupMenu(root, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+                              pt.x, pt.y, 0, hWnd, NULL);
+    DestroyMenu(root);
+    if (cmd >= IDM_SPLIT_BASE && cmd < IDM_SPLIT_BASE + PRESET_COUNT) {
+        set_split_layout(cmd - IDM_SPLIT_BASE);
+    }
+}
+
+/* =========================================================================
+ *                       CHEATSHEET MODAL
+ * ========================================================================= */
+
+static void cheatsheet_toggle(void) {
+    g_app.cheatsheetVisible = !g_app.cheatsheetVisible;
+    InvalidateRect(g_app.hWnd, NULL, FALSE);
+}
+
+typedef struct { const wchar_t* keys; const wchar_t* desc; } CheatRow;
+
+static void draw_cheatsheet(HDC dc, const RECT* cli) {
+    static const CheatRow rows[] = {
+        { L"Ctrl+T",        L"Nova aba (PowerShell)" },
+        { L"Ctrl+W",        L"Fechar aba ativa" },
+        { L"Ctrl+1..9",     L"Pular para aba N" },
+        { L"Ctrl+Tab",      L"Próxima aba" },
+        { L"Ctrl+Shift+Tab",L"Aba anterior" },
+        { L"Ctrl+/",        L"Mostrar/ocultar este atalho" },
+        { L"Ctrl+,",        L"Configurações" },
+        { L"Ctrl+L",        L"Foco na busca da sidebar" },
+        { L"Ctrl+Shift+C",  L"Lançar Claude no terminal ativo" },
+        { L"Ctrl+Shift+G",  L"Lançar Gemini no terminal ativo" },
+        { L"Ctrl+Shift+K",  L"Limpar linha do terminal" },
+        { L"Ctrl+D",        L"Duplicar aba ativa" },
+        { L"F1",            L"Sobre o Dante CLI" },
+        { L"▦ Layout",      L"Toolbar → grade 1×2, 2×1, 2×2, 1×3" },
+        { L"⚙ Config",      L"Tema, Groq API key, fonte, scrollback" },
+        { L"\U0001F3A4 Voz", L"Grava → envia Groq Whisper → injeta texto" },
+        { L"\U0001F4A1 Explicar", L"Manda última saída → Groq Chat → modal" },
+        { L"Botão direito na aba", L"Menu de cor, renomear, duplicar, fechar" },
+        { L"Duplo-clique na aba",  L"Renomear" },
+        { L"Arrastar aba", L"Reordenar" },
+        { L"Backspace",     L"Apagar 1 caractere" },
+        { L"Alt+Backspace", L"Apagar palavra (boundary leve)" },
+        { L"Ctrl+Backspace",L"Apagar palavra anterior (kill-word)" },
+    };
+
+    /* Dimmed backdrop */
+    HBRUSH dim = CreateSolidBrush(RGB(0, 0, 0));
+    int oldMode = SetROP2(dc, R2_COPYPEN);
+    BLENDFUNCTION bf = { AC_SRC_OVER, 0, 180, 0 };
+    HDC tmp = CreateCompatibleDC(dc);
+    HBITMAP bmp = CreateCompatibleBitmap(dc, cli->right, cli->bottom);
+    HBITMAP oldBmp = (HBITMAP)SelectObject(tmp, bmp);
+    RECT all = *cli; FillRect(tmp, &all, dim);
+    AlphaBlend(dc, 0, 0, cli->right, cli->bottom, tmp, 0, 0, cli->right, cli->bottom, bf);
+    SelectObject(tmp, oldBmp); DeleteObject(bmp); DeleteDC(tmp); DeleteObject(dim);
+    SetROP2(dc, oldMode);
+
+    /* Panel */
+    int W = 560, H = 450;
+    int x = (cli->right - W) / 2;
+    int y = (cli->bottom - H) / 2;
+    RECT panel = { x, y, x + W, y + H };
+    draw_rounded_rect(dc, panel, COL_BG_SIDE, COL_ACCENT, 14);
+
+    draw_text_w(dc, x + 24, y + 18, L"Atalhos do Dante CLI", COL_ACCENT, g_app.hFontBig);
+    draw_text_w(dc, x + 24, y + 56,
+                L"Pressione Ctrl+/ ou Esc para fechar",
+                COL_FG_DIM, g_app.hFontUI);
+
+    int rowY = y + 92;
+    int n = sizeof(rows) / sizeof(rows[0]);
+    for (int i = 0; i < n; ++i) {
+        draw_text_w(dc, x + 24,  rowY, rows[i].keys, COL_ACCENT2, g_app.hFontMono);
+        draw_text_w(dc, x + 220, rowY, rows[i].desc, COL_FG,     g_app.hFontUI);
+        rowY += 26;
+    }
+}
+
+/* =========================================================================
+ *                       GROQ HTTP CLIENT (chat + whisper)
+ *
+ * Uses WinHTTP for HTTPS. JSON requests are crafted by hand. Responses are
+ * parsed with a tiny "find value of key" search since the Groq response
+ * shape is well-known. Results are posted back to the UI thread.
+ * ========================================================================= */
+
+#define WM_DANTE_GROQ_RESULT (WM_APP + 2)
+#define WM_DANTE_GROQ_ERROR  (WM_APP + 3)
+
+typedef struct {
+    char* prompt;        /* UTF-8 user content */
+    char* system;        /* UTF-8 system prompt */
+    char* apiKey;        /* UTF-8 */
+} GroqChatReq;
+
+static char* w_to_utf8_dup(const wchar_t* w) {
+    int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, NULL, 0, NULL, NULL);
+    if (len <= 0) return NULL;
+    char* out = (char*)malloc(len);
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, out, len, NULL, NULL);
+    return out;
+}
+
+static wchar_t* utf8_to_w_dup(const char* s, int n) {
+    if (n < 0) n = (int)strlen(s);
+    int len = MultiByteToWideChar(CP_UTF8, 0, s, n, NULL, 0);
+    if (len < 0) return NULL;
+    wchar_t* out = (wchar_t*)malloc((len + 1) * sizeof(wchar_t));
+    MultiByteToWideChar(CP_UTF8, 0, s, n, out, len);
+    out[len] = 0;
+    return out;
+}
+
+/* Append `src` to *bufp/buflen (heap-grown). */
+static void str_append(char** bufp, size_t* cap, size_t* len, const char* src) {
+    size_t add = strlen(src);
+    if (*len + add + 1 > *cap) {
+        *cap = (*cap + add + 1) * 2;
+        *bufp = (char*)realloc(*bufp, *cap);
+    }
+    memcpy(*bufp + *len, src, add + 1);
+    *len += add;
+}
+
+static char* json_escape_str(const char* s) {
+    size_t cap = strlen(s) * 2 + 16;
+    char* out = (char*)malloc(cap);
+    size_t o = 0;
+    for (size_t i = 0; s[i]; ++i) {
+        unsigned char c = (unsigned char)s[i];
+        if (o + 8 >= cap) { cap *= 2; out = (char*)realloc(out, cap); }
+        if (c == '"' || c == '\\') { out[o++] = '\\'; out[o++] = (char)c; }
+        else if (c == '\n') { out[o++] = '\\'; out[o++] = 'n'; }
+        else if (c == '\r') { out[o++] = '\\'; out[o++] = 'r'; }
+        else if (c == '\t') { out[o++] = '\\'; out[o++] = 't'; }
+        else if (c < 0x20)  { o += (size_t)snprintf(out + o, cap - o, "\\u%04x", c); }
+        else                { out[o++] = (char)c; }
+    }
+    out[o] = 0;
+    return out;
+}
+
+/* Locate the value of "content" key in the Groq chat response and return it
+ * as a freshly allocated UTF-8 string. */
+static char* groq_extract_content(const char* json) {
+    const char* k = strstr(json, "\"content\"");
+    if (!k) return NULL;
+    k = strchr(k, ':');
+    if (!k) return NULL;
+    ++k;
+    while (*k == ' ' || *k == '\t' || *k == '\n' || *k == '\r') ++k;
+    if (*k != '"') return NULL;
+    ++k;
+    size_t cap = 1024;
+    char* out = (char*)malloc(cap);
+    size_t o = 0;
+    while (*k && *k != '"') {
+        if (o + 8 >= cap) { cap *= 2; out = (char*)realloc(out, cap); }
+        if (*k == '\\' && k[1]) {
+            char e = k[1];
+            if      (e == 'n')  out[o++] = '\n';
+            else if (e == 'r')  out[o++] = '\r';
+            else if (e == 't')  out[o++] = '\t';
+            else if (e == '"')  out[o++] = '"';
+            else if (e == '\\') out[o++] = '\\';
+            else if (e == 'u' && k[2] && k[3] && k[4] && k[5]) {
+                char hex[5] = {k[2], k[3], k[4], k[5], 0};
+                unsigned int code = (unsigned int)strtoul(hex, NULL, 16);
+                /* Encode as UTF-8 */
+                if (code < 0x80) out[o++] = (char)code;
+                else if (code < 0x800) {
+                    out[o++] = (char)(0xC0 | (code >> 6));
+                    out[o++] = (char)(0x80 | (code & 0x3F));
+                } else {
+                    out[o++] = (char)(0xE0 | (code >> 12));
+                    out[o++] = (char)(0x80 | ((code >> 6) & 0x3F));
+                    out[o++] = (char)(0x80 | (code & 0x3F));
+                }
+                k += 4;
+            }
+            else                out[o++] = e;
+            k += 2;
+        } else {
+            out[o++] = *k++;
+        }
+    }
+    out[o] = 0;
+    return out;
+}
+
+static char* https_post_json(const wchar_t* host, INTERNET_PORT port, const wchar_t* path,
+                              const wchar_t* bearer, const char* body,
+                              int* outStatus, int* outLen) {
+    *outStatus = 0; *outLen = 0;
+    HINTERNET hSession = WinHttpOpen(L"DanteCLI/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
+    if (!hSession) return NULL;
+    HINTERNET hConn = WinHttpConnect(hSession, host, port, 0);
+    if (!hConn) { WinHttpCloseHandle(hSession); return NULL; }
+    HINTERNET hReq = WinHttpOpenRequest(hConn, L"POST", path, NULL,
+                                         WINHTTP_NO_REFERER,
+                                         WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                         WINHTTP_FLAG_SECURE);
+    if (!hReq) { WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSession); return NULL; }
+
+    wchar_t headers[1024];
+    _snwprintf_s(headers, 1024, _TRUNCATE,
+                 L"Content-Type: application/json\r\nAuthorization: Bearer %s\r\n",
+                 bearer);
+
+    BOOL sent = WinHttpSendRequest(hReq, headers, (DWORD)-1L,
+                                    (LPVOID)body, (DWORD)strlen(body),
+                                    (DWORD)strlen(body), 0);
+    if (!sent) { WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSession); return NULL; }
+    if (!WinHttpReceiveResponse(hReq, NULL)) {
+        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSession);
+        return NULL;
+    }
+
+    DWORD status = 0; DWORD sz = sizeof(status);
+    WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX);
+    *outStatus = (int)status;
+
+    char* out = NULL; size_t cap = 0, len = 0;
+    DWORD avail = 0;
+    do {
+        if (!WinHttpQueryDataAvailable(hReq, &avail)) break;
+        if (avail == 0) break;
+        if (len + avail + 1 > cap) { cap = (len + avail + 1) * 2; out = (char*)realloc(out, cap); }
+        DWORD got = 0;
+        if (!WinHttpReadData(hReq, out + len, avail, &got)) break;
+        len += got;
+        out[len] = 0;
+    } while (avail > 0);
+    *outLen = (int)len;
+
+    WinHttpCloseHandle(hReq);
+    WinHttpCloseHandle(hConn);
+    WinHttpCloseHandle(hSession);
+    return out;
+}
+
+static DWORD WINAPI groq_chat_thread(LPVOID arg) {
+    GroqChatReq* req = (GroqChatReq*)arg;
+
+    char* sysEsc = json_escape_str(req->system);
+    char* userEsc = json_escape_str(req->prompt);
+
+    size_t bodyCap = strlen(sysEsc) + strlen(userEsc) + 512;
+    char* body = (char*)malloc(bodyCap);
+    snprintf(body, bodyCap,
+        "{\"model\":\"llama-3.3-70b-versatile\","
+        "\"temperature\":0.2,"
+        "\"messages\":["
+        "{\"role\":\"system\",\"content\":\"%s\"},"
+        "{\"role\":\"user\",\"content\":\"%s\"}"
+        "]}", sysEsc, userEsc);
+
+    wchar_t bearer[256];
+    MultiByteToWideChar(CP_UTF8, 0, req->apiKey, -1, bearer, 256);
+
+    int status = 0, respLen = 0;
+    char* resp = https_post_json(L"api.groq.com", INTERNET_DEFAULT_HTTPS_PORT,
+                                  L"/openai/v1/chat/completions",
+                                  bearer, body, &status, &respLen);
+
+    if (status == 200 && resp) {
+        char* content = groq_extract_content(resp);
+        if (content) {
+            wchar_t* w = utf8_to_w_dup(content, -1);
+            PostMessageW(g_app.hWnd, WM_DANTE_GROQ_RESULT, 0, (LPARAM)w);
+            free(content);
+        } else {
+            wchar_t* w = utf8_to_w_dup("Resposta vazia/JSON inesperado.", -1);
+            PostMessageW(g_app.hWnd, WM_DANTE_GROQ_ERROR, 0, (LPARAM)w);
+        }
+    } else {
+        char msg[256];
+        snprintf(msg, 256, "Erro HTTP %d ao falar com a Groq.\n\n%s",
+                 status, resp ? resp : "(sem corpo)");
+        wchar_t* w = utf8_to_w_dup(msg, -1);
+        PostMessageW(g_app.hWnd, WM_DANTE_GROQ_ERROR, 0, (LPARAM)w);
+    }
+
+    free(resp); free(body); free(sysEsc); free(userEsc);
+    free(req->prompt); free(req->system); free(req->apiKey); free(req);
+    return 0;
+}
+
+static BOOL g_groqInFlight = FALSE;
+
+static void groq_explain_active_terminal(void) {
+    if (g_app.activeTab < 0) return;
+    if (g_groqInFlight) {
+        MessageBoxW(g_app.hWnd, L"Já existe uma chamada em andamento.",
+                    APP_NAME_W, MB_ICONINFORMATION);
+        return;
+    }
+    if (g_app.groqApiKey[0] == 0) {
+        MessageBoxW(g_app.hWnd,
+            L"Configure a Groq API key em ⚙ Configurações primeiro.\n\nObtenha em https://console.groq.com/keys",
+            APP_NAME_W, MB_ICONWARNING);
+        return;
+    }
+
+    /* Grab the last N rows of the terminal as plain text */
+    Tab* t = g_app.tabs[g_app.activeTab];
+    int rows = t->grid.rows;
+    int cols = t->grid.cols;
+    int firstNonEmpty = 0;
+    for (int r = rows - 1; r >= 0; --r) {
+        int rowHas = 0;
+        for (int c = 0; c < cols; ++c) {
+            wchar_t ch = t->grid.cells[r * cols + c].ch;
+            if (ch && ch != L' ') { rowHas = 1; break; }
+        }
+        if (rowHas) { firstNonEmpty = r; }
+        if (rows - 1 - r > 25 && firstNonEmpty > 0) break;
+    }
+    int startRow = max_int(0, firstNonEmpty - 24);
+
+    wchar_t excerpt[8192]; excerpt[0] = 0;
+    size_t pos = 0;
+    for (int r = startRow; r < rows && pos < 7800; ++r) {
+        for (int c = 0; c < cols && pos < 7800; ++c) {
+            wchar_t ch = t->grid.cells[r * cols + c].ch;
+            excerpt[pos++] = (ch == 0) ? L' ' : ch;
+        }
+        excerpt[pos++] = L'\n';
+    }
+    excerpt[pos] = 0;
+
+    GroqChatReq* req = (GroqChatReq*)calloc(1, sizeof(*req));
+    req->system = w_to_utf8_dup(
+        L"Você é um especialista em terminal Windows e shells (cmd, PowerShell). "
+        L"O usuário vai colar a saída recente do terminal. Responda em PORTUGUÊS "
+        L"do Brasil, conciso, com bullets quando útil. Identifique erros, "
+        L"sugira comandos corretivos e contextualize ferramentas.");
+    req->prompt = w_to_utf8_dup(excerpt);
+    req->apiKey = w_to_utf8_dup(g_app.groqApiKey);
+
+    g_groqInFlight = TRUE;
+    HANDLE h = CreateThread(NULL, 0, groq_chat_thread, req, 0, NULL);
+    if (h) CloseHandle(h);
+
+    MessageBoxW(g_app.hWnd,
+        L"Consultando Groq…\n\nO resultado aparecerá em uma janela quando estiver pronto.",
+        APP_NAME_W, MB_ICONINFORMATION);
+}
+
+/* Result modal — read-only multiline edit. */
+typedef struct { HWND hEdit; HWND hCopy; HWND hClose; wchar_t* text; } GroqResultCtx;
+static GroqResultCtx* g_groqResCtx = NULL;
+
+static LRESULT CALLBACK GroqResWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE: {
+            g_groqResCtx->hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT",
+                g_groqResCtx->text ? g_groqResCtx->text : L"(vazio)",
+                WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL,
+                12, 12, 596, 376, hWnd, NULL, GetModuleHandleW(NULL), NULL);
+            SendMessageW(g_groqResCtx->hEdit, WM_SETFONT, (WPARAM)g_app.hFontUI, TRUE);
+
+            g_groqResCtx->hCopy = CreateWindowExW(0, L"BUTTON", L"Copiar tudo",
+                WS_CHILD | WS_VISIBLE,
+                12, 400, 110, 30, hWnd, (HMENU)301, GetModuleHandleW(NULL), NULL);
+            SendMessageW(g_groqResCtx->hCopy, WM_SETFONT, (WPARAM)g_app.hFontUI, TRUE);
+
+            g_groqResCtx->hClose = CreateWindowExW(0, L"BUTTON", L"Fechar",
+                WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+                518, 400, 90, 30, hWnd, (HMENU)IDCANCEL, GetModuleHandleW(NULL), NULL);
+            SendMessageW(g_groqResCtx->hClose, WM_SETFONT, (WPARAM)g_app.hFontUI, TRUE);
+            return 0;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wParam) == 301) {
+                /* Copy text */
+                if (g_groqResCtx->text && OpenClipboard(hWnd)) {
+                    EmptyClipboard();
+                    size_t n = wcslen(g_groqResCtx->text) + 1;
+                    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, n * sizeof(wchar_t));
+                    if (h) {
+                        wchar_t* p = (wchar_t*)GlobalLock(h);
+                        memcpy(p, g_groqResCtx->text, n * sizeof(wchar_t));
+                        GlobalUnlock(h);
+                        SetClipboardData(CF_UNICODETEXT, h);
+                    }
+                    CloseClipboard();
+                }
+            } else if (LOWORD(wParam) == IDCANCEL) {
+                DestroyWindow(hWnd);
+            }
+            return 0;
+        case WM_CLOSE:    DestroyWindow(hWnd); return 0;
+        case WM_DESTROY:
+            free(g_groqResCtx->text);
+            free(g_groqResCtx);
+            g_groqResCtx = NULL;
+            return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+/* =========================================================================
+ *                       VOICE RECORDING (waveIn + Whisper)
+ *
+ * Records 16kHz mono 16-bit PCM via the waveIn API, packs the captured
+ * samples into a WAV blob, then uploads as multipart/form-data to the
+ * Groq Whisper API. The transcription is injected into the active tab.
+ * ========================================================================= */
+
+#define VOICE_SAMPLE_RATE   16000
+#define VOICE_BITS_PER_SAMPLE 16
+#define VOICE_CHANNELS      1
+#define VOICE_BUFFER_MS     200
+#define VOICE_BUFFER_BYTES  ((VOICE_SAMPLE_RATE * VOICE_BUFFER_MS / 1000) * 2)
+#define VOICE_NUM_BUFFERS   4
+#define VOICE_MAX_SECONDS   60
+
+typedef struct {
+    HWAVEIN     hWaveIn;
+    WAVEHDR     hdrs[VOICE_NUM_BUFFERS];
+    char        bufs[VOICE_NUM_BUFFERS][VOICE_BUFFER_BYTES];
+    BOOL        recording;
+    BOOL        uploading;
+    DWORD       startTick;
+    char*       pcm;      /* heap-grown PCM stream */
+    size_t      pcmCap;
+    size_t      pcmLen;
+    CRITICAL_SECTION lock;
+} Voice;
+
+static Voice g_voice;
+
+#define WM_DANTE_VOICE_DONE  (WM_APP + 4)
+#define WM_DANTE_VOICE_ERROR (WM_APP + 5)
+
+static void voice_init(void) {
+    InitializeCriticalSection(&g_voice.lock);
+}
+
+static void voice_append(const char* data, size_t n) {
+    EnterCriticalSection(&g_voice.lock);
+    if (g_voice.pcmLen + n > g_voice.pcmCap) {
+        g_voice.pcmCap = (g_voice.pcmCap + n) * 2;
+        g_voice.pcm = (char*)realloc(g_voice.pcm, g_voice.pcmCap);
+    }
+    memcpy(g_voice.pcm + g_voice.pcmLen, data, n);
+    g_voice.pcmLen += n;
+    LeaveCriticalSection(&g_voice.lock);
+}
+
+static void CALLBACK voice_in_proc(HWAVEIN hwi, UINT msg, DWORD_PTR inst, DWORD_PTR p1, DWORD_PTR p2) {
+    (void)inst; (void)p2;
+    if (msg == WIM_DATA) {
+        WAVEHDR* h = (WAVEHDR*)p1;
+        if (g_voice.recording && h->dwBytesRecorded > 0) {
+            voice_append(h->lpData, h->dwBytesRecorded);
+        }
+        if (g_voice.recording) {
+            waveInAddBuffer(hwi, h, sizeof(*h));
+        }
+    }
+}
+
+static BOOL voice_start(void) {
+    if (g_voice.recording || g_voice.uploading) return FALSE;
+
+    WAVEFORMATEX wf = {0};
+    wf.wFormatTag      = WAVE_FORMAT_PCM;
+    wf.nChannels       = VOICE_CHANNELS;
+    wf.nSamplesPerSec  = VOICE_SAMPLE_RATE;
+    wf.wBitsPerSample  = VOICE_BITS_PER_SAMPLE;
+    wf.nBlockAlign     = wf.nChannels * wf.wBitsPerSample / 8;
+    wf.nAvgBytesPerSec = wf.nSamplesPerSec * wf.nBlockAlign;
+
+    MMRESULT mr = waveInOpen(&g_voice.hWaveIn, WAVE_MAPPER, &wf,
+                              (DWORD_PTR)voice_in_proc, 0, CALLBACK_FUNCTION);
+    if (mr != MMSYSERR_NOERROR) return FALSE;
+
+    g_voice.pcmLen = 0;
+    if (!g_voice.pcm) {
+        g_voice.pcmCap = VOICE_SAMPLE_RATE * 2 * 10;   /* ~10 s initial */
+        g_voice.pcm = (char*)malloc(g_voice.pcmCap);
+    }
+
+    for (int i = 0; i < VOICE_NUM_BUFFERS; ++i) {
+        ZeroMemory(&g_voice.hdrs[i], sizeof(WAVEHDR));
+        g_voice.hdrs[i].lpData = g_voice.bufs[i];
+        g_voice.hdrs[i].dwBufferLength = VOICE_BUFFER_BYTES;
+        waveInPrepareHeader(g_voice.hWaveIn, &g_voice.hdrs[i], sizeof(WAVEHDR));
+        waveInAddBuffer(g_voice.hWaveIn, &g_voice.hdrs[i], sizeof(WAVEHDR));
+    }
+
+    g_voice.recording = TRUE;
+    g_voice.startTick = GetTickCount();
+    waveInStart(g_voice.hWaveIn);
+    InvalidateRect(g_app.hWnd, NULL, FALSE);
+    return TRUE;
+}
+
+static char* build_wav_blob(size_t* outLen) {
+    EnterCriticalSection(&g_voice.lock);
+    size_t pcmLen = g_voice.pcmLen;
+    LeaveCriticalSection(&g_voice.lock);
+
+    /* Minimal RIFF + fmt + data */
+    size_t blob = 44 + pcmLen;
+    char* out = (char*)malloc(blob);
+    memcpy(out, "RIFF", 4);
+    uint32_t riff_size = (uint32_t)(blob - 8);
+    memcpy(out + 4, &riff_size, 4);
+    memcpy(out + 8, "WAVE", 4);
+    memcpy(out + 12, "fmt ", 4);
+    uint32_t fmt_size = 16;
+    memcpy(out + 16, &fmt_size, 4);
+    uint16_t audio_fmt = 1, channels = VOICE_CHANNELS;
+    uint32_t sample_rate = VOICE_SAMPLE_RATE;
+    uint16_t bps = VOICE_BITS_PER_SAMPLE;
+    uint16_t block_align = channels * bps / 8;
+    uint32_t byte_rate = sample_rate * block_align;
+    memcpy(out + 20, &audio_fmt, 2);
+    memcpy(out + 22, &channels, 2);
+    memcpy(out + 24, &sample_rate, 4);
+    memcpy(out + 28, &byte_rate, 4);
+    memcpy(out + 32, &block_align, 2);
+    memcpy(out + 34, &bps, 2);
+    memcpy(out + 36, "data", 4);
+    uint32_t data_size = (uint32_t)pcmLen;
+    memcpy(out + 40, &data_size, 4);
+    memcpy(out + 44, g_voice.pcm, pcmLen);
+
+    *outLen = blob;
+    return out;
+}
+
+typedef struct {
+    char* wav;
+    size_t wavLen;
+    char* apiKey;
+    char* lang;
+} WhisperReq;
+
+static char* groq_extract_text_field(const char* json) {
+    /* Whisper response: {"text": "..."} */
+    const char* k = strstr(json, "\"text\"");
+    if (!k) return NULL;
+    k = strchr(k, ':');
+    if (!k) return NULL;
+    ++k;
+    while (*k == ' ' || *k == '\t') ++k;
+    if (*k != '"') return NULL;
+    ++k;
+    size_t cap = 512; char* out = (char*)malloc(cap); size_t o = 0;
+    while (*k && *k != '"') {
+        if (o + 6 >= cap) { cap *= 2; out = (char*)realloc(out, cap); }
+        if (*k == '\\' && k[1]) {
+            char e = k[1];
+            if (e == 'n') out[o++] = '\n';
+            else if (e == 't') out[o++] = '\t';
+            else if (e == '"') out[o++] = '"';
+            else if (e == '\\') out[o++] = '\\';
+            else if (e == 'u' && k[2] && k[3] && k[4] && k[5]) {
+                char hex[5] = {k[2], k[3], k[4], k[5], 0};
+                unsigned int code = (unsigned int)strtoul(hex, NULL, 16);
+                if (code < 0x80) out[o++] = (char)code;
+                else if (code < 0x800) {
+                    out[o++] = (char)(0xC0 | (code >> 6));
+                    out[o++] = (char)(0x80 | (code & 0x3F));
+                } else {
+                    out[o++] = (char)(0xE0 | (code >> 12));
+                    out[o++] = (char)(0x80 | ((code >> 6) & 0x3F));
+                    out[o++] = (char)(0x80 | (code & 0x3F));
+                }
+                k += 4;
+            } else out[o++] = e;
+            k += 2;
+        } else {
+            out[o++] = *k++;
+        }
+    }
+    out[o] = 0;
+    return out;
+}
+
+static char* https_post_multipart(const wchar_t* host, INTERNET_PORT port, const wchar_t* path,
+                                    const wchar_t* bearer,
+                                    const char* boundary,
+                                    const char* body, size_t bodyLen,
+                                    int* outStatus, int* outLen) {
+    *outStatus = 0; *outLen = 0;
+    HINTERNET hSession = WinHttpOpen(L"DanteCLI/1.0",
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
+    if (!hSession) return NULL;
+    HINTERNET hConn = WinHttpConnect(hSession, host, port, 0);
+    if (!hConn) { WinHttpCloseHandle(hSession); return NULL; }
+    HINTERNET hReq = WinHttpOpenRequest(hConn, L"POST", path, NULL,
+                                         WINHTTP_NO_REFERER,
+                                         WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                         WINHTTP_FLAG_SECURE);
+    if (!hReq) { WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSession); return NULL; }
+
+    wchar_t headers[2048];
+    _snwprintf_s(headers, 2048, _TRUNCATE,
+                 L"Content-Type: multipart/form-data; boundary=%S\r\n"
+                 L"Authorization: Bearer %s\r\n",
+                 boundary, bearer);
+
+    if (!WinHttpSendRequest(hReq, headers, (DWORD)-1L,
+                             (LPVOID)body, (DWORD)bodyLen, (DWORD)bodyLen, 0)) {
+        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSession);
+        return NULL;
+    }
+    if (!WinHttpReceiveResponse(hReq, NULL)) {
+        WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSession);
+        return NULL;
+    }
+    DWORD status = 0; DWORD sz = sizeof(status);
+    WinHttpQueryHeaders(hReq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX);
+    *outStatus = (int)status;
+
+    char* out = NULL; size_t cap = 0, len = 0;
+    DWORD avail = 0;
+    do {
+        if (!WinHttpQueryDataAvailable(hReq, &avail)) break;
+        if (avail == 0) break;
+        if (len + avail + 1 > cap) { cap = (len + avail + 1) * 2; out = (char*)realloc(out, cap); }
+        DWORD got = 0;
+        if (!WinHttpReadData(hReq, out + len, avail, &got)) break;
+        len += got;
+        out[len] = 0;
+    } while (avail > 0);
+    *outLen = (int)len;
+
+    WinHttpCloseHandle(hReq); WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSession);
+    return out;
+}
+
+static DWORD WINAPI whisper_thread(LPVOID arg) {
+    WhisperReq* req = (WhisperReq*)arg;
+
+    const char* boundary = "----danteCLIBoundary7Z";
+    /* Build multipart body */
+    const char* fileHeader_fmt =
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"model\"\r\n\r\n"
+        "whisper-large-v3-turbo\r\n"
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"response_format\"\r\n\r\n"
+        "json\r\n"
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"language\"\r\n\r\n"
+        "%s\r\n"
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"file\"; filename=\"voice.wav\"\r\n"
+        "Content-Type: audio/wav\r\n\r\n";
+
+    char header[1024];
+    snprintf(header, 1024, fileHeader_fmt, boundary, boundary, boundary, req->lang, boundary);
+
+    char footer[64];
+    snprintf(footer, 64, "\r\n--%s--\r\n", boundary);
+
+    size_t bodyLen = strlen(header) + req->wavLen + strlen(footer);
+    char* body = (char*)malloc(bodyLen);
+    size_t pos = 0;
+    memcpy(body + pos, header, strlen(header)); pos += strlen(header);
+    memcpy(body + pos, req->wav, req->wavLen); pos += req->wavLen;
+    memcpy(body + pos, footer, strlen(footer));
+
+    wchar_t bearer[256];
+    MultiByteToWideChar(CP_UTF8, 0, req->apiKey, -1, bearer, 256);
+
+    int status = 0, respLen = 0;
+    char* resp = https_post_multipart(L"api.groq.com", INTERNET_DEFAULT_HTTPS_PORT,
+                                       L"/openai/v1/audio/transcriptions",
+                                       bearer, boundary, body, bodyLen,
+                                       &status, &respLen);
+
+    if (status == 200 && resp) {
+        char* text = groq_extract_text_field(resp);
+        if (text) {
+            wchar_t* w = utf8_to_w_dup(text, -1);
+            PostMessageW(g_app.hWnd, WM_DANTE_VOICE_DONE, 0, (LPARAM)w);
+            free(text);
+        } else {
+            wchar_t* w = utf8_to_w_dup("Não foi possível ler a transcrição.", -1);
+            PostMessageW(g_app.hWnd, WM_DANTE_VOICE_ERROR, 0, (LPARAM)w);
+        }
+    } else {
+        char msg[256];
+        snprintf(msg, 256, "Erro HTTP %d ao falar com a Groq (Whisper).\n\n%s",
+                 status, resp ? resp : "(sem corpo)");
+        wchar_t* w = utf8_to_w_dup(msg, -1);
+        PostMessageW(g_app.hWnd, WM_DANTE_VOICE_ERROR, 0, (LPARAM)w);
+    }
+
+    free(resp); free(body);
+    free(req->wav); free(req->apiKey); free(req->lang); free(req);
+    return 0;
+}
+
+static void voice_stop_and_upload(void) {
+    if (!g_voice.recording) return;
+    g_voice.recording = FALSE;
+    waveInStop(g_voice.hWaveIn);
+    waveInReset(g_voice.hWaveIn);
+    for (int i = 0; i < VOICE_NUM_BUFFERS; ++i) {
+        waveInUnprepareHeader(g_voice.hWaveIn, &g_voice.hdrs[i], sizeof(WAVEHDR));
+    }
+    waveInClose(g_voice.hWaveIn);
+    g_voice.hWaveIn = NULL;
+
+    /* Validate: at least ~0.4s of audio (16000 * 2 * 0.4 = 12800 bytes) */
+    if (g_voice.pcmLen < 12800) {
+        MessageBoxW(g_app.hWnd,
+            L"Áudio muito curto (< 0.4s). Tente novamente, segurando o botão por mais tempo.",
+            APP_NAME_W, MB_ICONWARNING);
+        InvalidateRect(g_app.hWnd, NULL, FALSE);
+        return;
+    }
+
+    if (g_app.groqApiKey[0] == 0) {
+        MessageBoxW(g_app.hWnd,
+            L"Configure a Groq API key em ⚙ Configurações primeiro.",
+            APP_NAME_W, MB_ICONWARNING);
+        InvalidateRect(g_app.hWnd, NULL, FALSE);
+        return;
+    }
+
+    size_t wavLen = 0;
+    char* wav = build_wav_blob(&wavLen);
+
+    WhisperReq* req = (WhisperReq*)calloc(1, sizeof(*req));
+    req->wav = wav;
+    req->wavLen = wavLen;
+    req->apiKey = w_to_utf8_dup(g_app.groqApiKey);
+    req->lang = w_to_utf8_dup(g_app.voiceLang[0] ? g_app.voiceLang : L"pt");
+    g_voice.uploading = TRUE;
+    HANDLE h = CreateThread(NULL, 0, whisper_thread, req, 0, NULL);
+    if (h) CloseHandle(h);
+    InvalidateRect(g_app.hWnd, NULL, FALSE);
+}
+
+static void voice_toggle(void) {
+    if (g_voice.recording) {
+        voice_stop_and_upload();
+    } else if (g_voice.uploading) {
+        MessageBoxW(g_app.hWnd, L"Aguardando resposta da Groq...",
+                    APP_NAME_W, MB_ICONINFORMATION);
+    } else {
+        if (g_app.groqApiKey[0] == 0) {
+            MessageBoxW(g_app.hWnd,
+                L"Configure a Groq API key em ⚙ Configurações primeiro.",
+                APP_NAME_W, MB_ICONWARNING);
+            return;
+        }
+        if (!voice_start()) {
+            MessageBoxW(g_app.hWnd,
+                L"Não foi possível abrir o dispositivo de microfone.",
+                APP_NAME_W, MB_ICONERROR);
+        }
+    }
+}
+
+static void show_groq_result(const wchar_t* title, wchar_t* text /* owned */) {
+    static BOOL registered = FALSE;
+    if (!registered) {
+        WNDCLASSEXW wc = { sizeof(wc) };
+        wc.lpfnWndProc = GroqResWndProc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"DanteGroqResult";
+        RegisterClassExW(&wc);
+        registered = TRUE;
+    }
+    g_groqResCtx = (GroqResultCtx*)calloc(1, sizeof(*g_groqResCtx));
+    g_groqResCtx->text = text;
+
+    RECT pr; GetWindowRect(g_app.hWnd, &pr);
+    int W = 640, H = 480;
+    int x = pr.left + ((pr.right - pr.left) - W) / 2;
+    int y = pr.top  + ((pr.bottom - pr.top) - H) / 2;
+
+    HWND dlg = CreateWindowExW(0, L"DanteGroqResult", title,
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        x, y, W, H, g_app.hWnd, NULL, GetModuleHandleW(NULL), NULL);
+    ShowWindow(dlg, SW_SHOW);
+}
+
+/* =========================================================================
+ *                              TABS
+ * ========================================================================= */
+
+static void open_new_tab(const wchar_t* shellId) {
+    if (g_app.tabCount >= MAX_TABS) return;
+
+    Tab* t = (Tab*)xcalloc(1, sizeof(Tab));
+    t->id = next_tab_id++;
+    int idx = g_app.tabCount;
+    swprintf(t->title, 128, L"Terminal %d", idx + 1);
+    str_copy_w(t->emoji, 8, (idx % 2 == 0) ? L"\U0001F4BB" : L"⚡");
+    t->colorIdx = idx % 12;
+    terminal_grid_init(&t->grid, 120, 30);
+    parser_init(&t->parser);
+
+    t->session = session_create(shellId ? shellId : L"powershell", 120, 30);
+    if (t->session) t->session->ownerTabId = t->id;
+
+    g_app.tabs[g_app.tabCount++] = t;
+    g_app.activeTab = g_app.tabCount - 1;
+    schedule_persist();
+    InvalidateRect(g_app.hWnd, NULL, FALSE);
+    update_status();
+}
+
+static void close_tab(int idx) {
+    if (idx < 0 || idx >= g_app.tabCount) return;
+    Tab* t = g_app.tabs[idx];
+    session_destroy(t->session);
+    terminal_grid_free(&t->grid);
+    free(t);
+    for (int i = idx; i < g_app.tabCount - 1; ++i) g_app.tabs[i] = g_app.tabs[i + 1];
+    g_app.tabCount--;
+
+    /* Patch splitSlots — every slot pointing at an index >= idx must shift
+     * down. Slots pointing AT the removed tab become empty (-1). Without
+     * this, closing a tab while split was active rendered the wrong tab in
+     * the cell, or worse, accessed g_app.tabs[stale] which could be NULL. */
+    for (int i = 0; i < MAX_SPLIT_CELLS; ++i) {
+        if (g_app.splitSlots[i] == idx) g_app.splitSlots[i] = -1;
+        else if (g_app.splitSlots[i] > idx) g_app.splitSlots[i]--;
+    }
+
+    if (g_app.tabCount == 0) {
+        open_new_tab(L"powershell");
+        return;
+    }
+    if (g_app.activeTab >= g_app.tabCount) g_app.activeTab = g_app.tabCount - 1;
+    if (g_app.activeTab > idx) g_app.activeTab--;
+    else if (g_app.activeTab == idx && g_app.activeTab >= g_app.tabCount)
+        g_app.activeTab = g_app.tabCount - 1;
+    schedule_persist();
+    InvalidateRect(g_app.hWnd, NULL, FALSE);
+    update_status();
+}
+
+static void inject_into_active(const wchar_t* text) {
+    if (g_app.activeTab < 0 || g_app.activeTab >= g_app.tabCount) return;
+    Tab* t = g_app.tabs[g_app.activeTab];
+    if (!t || !t->session) return;
+    char utf[2048];
+    int n = WideCharToMultiByte(CP_UTF8, 0, text, -1, utf, sizeof(utf), NULL, NULL);
+    if (n > 0) session_write(t->session, utf, n - 1);
+}
+
+static void invalidate_terminal(void) {
+    InvalidateRect(g_app.hWnd, NULL, FALSE);
+}
+
+/* =========================================================================
+ *                              LAYOUT
+ * ========================================================================= */
+
+static void layout_compute(RECT* outSide, RECT* outTabBar, RECT* outTerm, RECT* outToolbar, RECT* outStatus) {
+    RECT cr; GetClientRect(g_app.hWnd, &cr);
+    int W = cr.right - cr.left;
+    int H = cr.bottom - cr.top;
+
+    outSide->left = 0; outSide->top = 0; outSide->right = SIDEBAR_W; outSide->bottom = H - STATUSBAR_H;
+
+    outTabBar->left = SIDEBAR_W; outTabBar->top = 0;
+    outTabBar->right = W; outTabBar->bottom = TABBAR_H;
+
+    outToolbar->left = SIDEBAR_W; outToolbar->top = H - STATUSBAR_H - TOOLBAR_AI_H;
+    outToolbar->right = W; outToolbar->bottom = H - STATUSBAR_H;
+
+    outTerm->left = SIDEBAR_W; outTerm->top = TABBAR_H;
+    outTerm->right = W; outTerm->bottom = outToolbar->top;
+
+    outStatus->left = 0; outStatus->top = H - STATUSBAR_H;
+    outStatus->right = W; outStatus->bottom = H;
+}
+
+/* =========================================================================
+ *                              DRAW
+ * ========================================================================= */
+
+static void fill_rect_color(HDC dc, const RECT* r, COLORREF c) {
+    HBRUSH b = CreateSolidBrush(c);
+    FillRect(dc, r, b);
+    DeleteObject(b);
+}
+
+static void draw_text_w(HDC dc, int x, int y, const wchar_t* s, COLORREF color, HFONT font) {
+    HFONT old = (HFONT)SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, color);
+    TextOutW(dc, x, y, s, (int)wcslen(s));
+    SelectObject(dc, old);
+}
+
+static void draw_rounded_rect(HDC dc, RECT r, COLORREF fill, COLORREF border, int radius) {
+    HBRUSH br = CreateSolidBrush(fill);
+    HPEN  pen = border ? CreatePen(PS_SOLID, 1, border) : (HPEN)GetStockObject(NULL_PEN);
+    HBRUSH oldBr = (HBRUSH)SelectObject(dc, br);
+    HPEN   oldPen = (HPEN)SelectObject(dc, pen);
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, radius, radius);
+    SelectObject(dc, oldBr); SelectObject(dc, oldPen);
+    DeleteObject(br); if (border) DeleteObject(pen);
+}
+
+/* ---------- Sidebar ---------- */
+
+static int sidebar_mode_button_rect(int idx, const RECT* sideRc, RECT* out) {
+    int btnW = (sideRc->right - sideRc->left - 24) / MODE_COUNT;
+    int btnH = 32;
+    out->left = sideRc->left + 12 + idx * btnW;
+    out->right = out->left + btnW - 4;
+    out->top = sideRc->top + 6;
+    out->bottom = out->top + btnH;
+    return 1;
+}
+
+static void draw_sidebar(HDC dc, const RECT* rc) {
+    fill_rect_color(dc, rc, COL_BG_SIDE);
+
+    /* Vertical divider on the right */
+    RECT div = { rc->right - 1, rc->top, rc->right, rc->bottom };
+    fill_rect_color(dc, &div, COL_DIV);
+
+    /* Mode tabs at the top */
+    for (int i = 0; i < MODE_COUNT; ++i) {
+        RECT br;
+        sidebar_mode_button_rect(i, rc, &br);
+        BOOL active = (g_app.sidebarMode == (SidebarMode)i);
+        BOOL hover = (g_app.sidebarHoverIdx == i);
+        COLORREF bg = active ? COL_TAB_ACTIVE : (hover ? COL_BG_CHIP_H : COL_BG_CHIP);
+        COLORREF fg = active ? RGB(0x16, 0x16, 0x1E) : COL_FG;
+        draw_rounded_rect(dc, br, bg, 0, 8);
+        SIZE sz;
+        HFONT f = g_app.hFontEmoji;
+        HFONT old = (HFONT)SelectObject(dc, f);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, fg);
+        GetTextExtentPoint32W(dc, kSidebarModeIcons[i], (int)wcslen(kSidebarModeIcons[i]), &sz);
+        TextOutW(dc, br.left + ((br.right - br.left) - sz.cx) / 2,
+                 br.top + ((br.bottom - br.top) - sz.cy) / 2,
+                 kSidebarModeIcons[i], (int)wcslen(kSidebarModeIcons[i]));
+        SelectObject(dc, old);
+    }
+
+    /* Header label */
+    {
+        const wchar_t* label = kSidebarModeLabels[g_app.sidebarMode];
+        draw_text_w(dc, rc->left + 16, rc->top + SIDEBAR_HDR_H + 8,
+                    label, COL_FG, g_app.hFontUI);
+    }
+
+    /* Search box (visual only) */
+    RECT search = { rc->left + 12, rc->top + SIDEBAR_HDR_H + 38,
+                    rc->right - 12, rc->top + SIDEBAR_HDR_H + 70 };
+    draw_rounded_rect(dc, search, COL_BG_CHIP, COL_DIV, 6);
+    draw_text_w(dc, search.left + 10, search.top + 7,
+                L"\U0001F50D  Buscar...", COL_FG_DIM, g_app.hFontUI);
+
+    /* Items list */
+    int y = search.bottom + 12;
+    int itemCount = 0;
+    switch (g_app.sidebarMode) {
+        case MODE_FAVORITES: itemCount = g_app.favoriteCount; break;
+        case MODE_SNIPPETS:  itemCount = g_app.snippetCount;  break;
+        case MODE_CREDS:     itemCount = g_app.credCount;     break;
+        case MODE_FILES: {
+            const wchar_t* hint = L"Arraste pastas do Explorer para abrir aqui.\n\n(Visualização básica nesta release; integração completa em breve.)";
+            RECT tip = { rc->left + 16, y, rc->right - 16, rc->bottom - 8 };
+            HFONT old = (HFONT)SelectObject(dc, g_app.hFontUI);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, COL_FG_DIM);
+            DrawTextW(dc, hint, -1, &tip, DT_WORDBREAK | DT_LEFT);
+            SelectObject(dc, old);
+            return;
+        }
+        default: break;
+    }
+
+    if (itemCount == 0) {
+        const wchar_t* empty =
+            (g_app.sidebarMode == MODE_FAVORITES) ?
+                L"Nenhum favorito ainda.\n\nClique em ⊕ Adicionar para guardar um caminho frequente que abrirá uma nova aba já com cd <pasta>." :
+            (g_app.sidebarMode == MODE_SNIPPETS) ?
+                L"Nenhum snippet ainda.\n\nSnippets são blocos de comando reutilizáveis. Um clique injeta no terminal ativo." :
+                L"Nenhuma credencial ainda.\n\nGuarde SSH/FTP/API/Custom — clicar injeta um bloco comentado para a IA usar como contexto.";
+        RECT tip = { rc->left + 16, y, rc->right - 16, rc->bottom - 60 };
+        HFONT old = (HFONT)SelectObject(dc, g_app.hFontUI);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, COL_FG_DIM);
+        DrawTextW(dc, empty, -1, &tip, DT_WORDBREAK | DT_LEFT);
+        SelectObject(dc, old);
+    } else {
+        /* Render each item as a card */
+        HFONT oldName = (HFONT)SelectObject(dc, g_app.hFontUI);
+        SetBkMode(dc, TRANSPARENT);
+        int rowH = 46;
+        for (int i = 0; i < itemCount && y + rowH < rc->bottom - 48; ++i) {
+            RECT row = { rc->left + 12, y, rc->right - 12, y + rowH - 4 };
+            BOOL hover = (g_app.sidebarItemHoverIdx == i);
+            draw_rounded_rect(dc, row, hover ? COL_BG_CHIP_H : COL_BG_CHIP, 0, 8);
+
+            const wchar_t* emoji = L"";
+            const wchar_t* title = L"";
+            wchar_t sub[256] = {0};
+
+            if (g_app.sidebarMode == MODE_FAVORITES) {
+                emoji = g_app.favorites[i].emoji;
+                title = g_app.favorites[i].name;
+                str_copy_w(sub, 256, g_app.favorites[i].path);
+            } else if (g_app.sidebarMode == MODE_SNIPPETS) {
+                emoji = g_app.snippets[i].emoji;
+                title = g_app.snippets[i].name;
+                str_copy_w(sub, 256, g_app.snippets[i].cmd);
+            } else if (g_app.sidebarMode == MODE_CREDS) {
+                emoji = g_app.creds[i].emoji;
+                title = g_app.creds[i].name;
+                _snwprintf_s(sub, 256, _TRUNCATE, L"%s · %s@%s",
+                             g_app.creds[i].kind, g_app.creds[i].user, g_app.creds[i].host);
+            }
+
+            draw_text_w(dc, row.left + 10, row.top + 6, emoji, COL_FG, g_app.hFontEmoji);
+            draw_text_w(dc, row.left + 36, row.top + 6, title, COL_FG, g_app.hFontUI);
+
+            /* Truncate sub */
+            wchar_t shortened[64];
+            size_t sl = wcslen(sub);
+            if (sl > 32) {
+                wcsncpy_s(shortened, 64, sub, 31);
+                shortened[31] = L'…';
+                shortened[32] = 0;
+            } else {
+                wcscpy_s(shortened, 64, sub);
+            }
+            draw_text_w(dc, row.left + 36, row.top + 24, shortened, COL_FG_DIM, g_app.hFontUI);
+
+            y += rowH;
+        }
+        SelectObject(dc, oldName);
+    }
+
+    /* "+ Adicionar" footer button — always present */
+    RECT add = { rc->left + 12, rc->bottom - 44, rc->right - 12, rc->bottom - 12 };
+    draw_rounded_rect(dc, add, COL_BG_CHIP, COL_ACCENT, 8);
+    SIZE sz;
+    HFONT old2 = (HFONT)SelectObject(dc, g_app.hFontUI);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, COL_ACCENT);
+    const wchar_t* lbl = L"⊕  Adicionar";
+    GetTextExtentPoint32W(dc, lbl, (int)wcslen(lbl), &sz);
+    TextOutW(dc, add.left + ((add.right - add.left) - sz.cx) / 2,
+             add.top + ((add.bottom - add.top) - sz.cy) / 2,
+             lbl, (int)wcslen(lbl));
+    SelectObject(dc, old2);
+}
+
+/* ---------- TabBar ---------- */
+
+static int tab_chip_x(int idx) {
+    int x = SIDEBAR_W + 10 - g_app.tabBarScroll;
+    for (int i = 0; i < idx; ++i) x += 156;
+    return x;
+}
+
+static void draw_tabbar(HDC dc, const RECT* rc) {
+    fill_rect_color(dc, rc, COL_BG_TABBAR);
+
+    /* Bottom divider */
+    RECT div = { rc->left, rc->bottom - 1, rc->right, rc->bottom };
+    fill_rect_color(dc, &div, COL_DIV);
+
+    for (int i = 0; i < g_app.tabCount; ++i) {
+        Tab* t = g_app.tabs[i];
+        int x = tab_chip_x(i);
+        RECT chip = { x, rc->top + 5, x + 146, rc->bottom - 5 };
+        BOOL active = (i == g_app.activeTab);
+        BOOL hover  = (i == g_app.tabBarHoverIdx);
+
+        COLORREF acc = (t->colorIdx >= 0) ? kTabColors[t->colorIdx] : COL_ACCENT;
+        COLORREF bg = active ? acc : (hover ? COL_BG_CHIP_H : COL_BG_CHIP);
+        if (active) {
+            /* Attached-to-body look: only top corners rounded */
+            RECT body = chip;
+            body.bottom += 2;
+            HBRUSH br = CreateSolidBrush(bg);
+            HPEN pen = CreatePen(PS_SOLID, 1, bg);
+            HBRUSH oBr = (HBRUSH)SelectObject(dc, br);
+            HPEN  oPen = (HPEN)SelectObject(dc, pen);
+            RoundRect(dc, body.left, body.top, body.right, body.bottom, 10, 10);
+            /* Mask off the bottom corners by drawing a small rect */
+            RECT mask = { body.left, body.bottom - 4, body.right, body.bottom };
+            FillRect(dc, &mask, br);
+            SelectObject(dc, oBr); SelectObject(dc, oPen);
+            DeleteObject(br); DeleteObject(pen);
+        } else {
+            draw_rounded_rect(dc, chip, bg, 0, 14);
+        }
+
+        /* Pin indicator */
+        int textX = chip.left + 10;
+        if (t->pinned) {
+            draw_text_w(dc, textX, chip.top + 6, L"\U0001F4CC", COL_ORANGE, g_app.hFontEmoji);
+            textX += 18;
+        }
+        /* Emoji */
+        if (t->emoji[0]) {
+            draw_text_w(dc, textX, chip.top + 6, t->emoji,
+                        active ? RGB(0x16,0x16,0x1E) : COL_FG, g_app.hFontEmoji);
+            textX += 22;
+        }
+
+        /* Title (truncated) */
+        wchar_t shown[64];
+        size_t tl = wcslen(t->title);
+        if (tl > 12) {
+            wcsncpy_s(shown, 64, t->title, 11);
+            shown[11] = L'…';
+            shown[12] = 0;
+        } else {
+            wcscpy_s(shown, 64, t->title);
+        }
+        draw_text_w(dc, textX, chip.top + 8, shown,
+                    active ? RGB(0x16,0x16,0x1E) : COL_FG, g_app.hFontUI);
+
+        /* Close button (× at right) */
+        if (!t->pinned) {
+            RECT closeR = { chip.right - 24, chip.top + 6, chip.right - 6, chip.bottom - 6 };
+            draw_text_w(dc, closeR.left + 4, closeR.top + 2, L"×",
+                        active ? RGB(0x16,0x16,0x1E) : COL_FG_DIM, g_app.hFontUI);
+        }
+    }
+
+    /* "+" button */
+    int plusX = tab_chip_x(g_app.tabCount) + 4;
+    RECT plus = { plusX, rc->top + 7, plusX + 32, rc->bottom - 7 };
+    draw_rounded_rect(dc, plus, COL_BG_CHIP, 0, 8);
+    HFONT old = (HFONT)SelectObject(dc, g_app.hFontBig);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, COL_ACCENT);
+    DrawTextW(dc, L"+", -1, &plus, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(dc, old);
+}
+
+/* ---------- Terminal ---------- */
+
+static COLORREF resolve_fg(const Cell* c) {
+    if (c->attr & ATTR_FG_RGB) return c->fgRgb;
+    if (c->attr & ATTR_FG_DEFAULT) return current_scheme()->fg;
+    return kAnsiPalette[c->fgIdx & 0x0F];
+}
+static COLORREF resolve_bg(const Cell* c) {
+    if (c->attr & ATTR_BG_RGB) return c->bgRgb;
+    if (c->attr & ATTR_BG_DEFAULT) return current_scheme()->bg;
+    return kAnsiPalette[c->bgIdx & 0x0F];
+}
+
+static void measure_cell(HDC dc) {
+    /* Recreate the mono font if user changed the size. */
+    if (g_app.fontPxOverride > 0) {
+        static int lastSize = 0;
+        if (g_app.fontPxOverride != lastSize) {
+            if (g_app.hFontMono)     DeleteObject(g_app.hFontMono);
+            if (g_app.hFontMonoBold) DeleteObject(g_app.hFontMonoBold);
+            g_app.hFontMono = CreateFontW(-g_app.fontPxOverride, 0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Cascadia Code");
+            g_app.hFontMonoBold = CreateFontW(-g_app.fontPxOverride, 0,0,0,FW_BOLD,FALSE,FALSE,FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Cascadia Code");
+            lastSize = g_app.fontPxOverride;
+        }
+    }
+    HFONT old = (HFONT)SelectObject(dc, g_app.hFontMono);
+    TEXTMETRICW tm;
+    GetTextMetricsW(dc, &tm);
+    SIZE s;
+    GetTextExtentPoint32W(dc, L"M", 1, &s);
+    g_app.cellW = max_int(s.cx, tm.tmAveCharWidth);
+    g_app.cellH = tm.tmHeight;
+    SelectObject(dc, old);
+}
+
+static int active_tab_index(void) {
+    if (g_app.splitLayout == PRESET_SINGLE) return g_app.activeTab;
+    const SplitPreset* preset = &kPresets[g_app.splitLayout];
+    int slot = clamp_int(g_app.splitActiveCell, 0, preset->cellCount - 1);
+    int idx = g_app.splitSlots[slot];
+    if (idx < 0 || idx >= g_app.tabCount) return g_app.activeTab;
+    return idx;
+}
+
+/* Render one terminal cell. Computes grid resize for the inner area. */
+static void draw_terminal_cell(HDC dc, const RECT* rc, int tabIdx, BOOL hasFocus) {
+    const ColorScheme* sc = current_scheme();
+    fill_rect_color(dc, rc, sc->bg);
+
+    if (tabIdx < 0 || tabIdx >= g_app.tabCount) {
+        /* Empty slot */
+        HFONT old = (HFONT)SelectObject(dc, g_app.hFontUI);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, COL_FG_DIM);
+        DrawTextW(dc, L"⊕\nslot vazio", -1, (RECT*)rc,
+                  DT_CENTER | DT_VCENTER | DT_WORDBREAK);
+        SelectObject(dc, old);
+        return;
+    }
+    Tab* t = g_app.tabs[tabIdx];
+    if (!t) return;
+
+    /* Tab indicator strip (left side of terminal area, matches chip color) */
+    COLORREF acc = (t->colorIdx >= 0) ? kTabColors[t->colorIdx] : COL_ACCENT;
+    RECT strip = { rc->left, rc->top, rc->left + 3, rc->bottom };
+    fill_rect_color(dc, &strip, acc);
+
+    /* Focus border */
+    if (hasFocus && g_app.splitLayout != PRESET_SINGLE) {
+        HPEN pen = CreatePen(PS_SOLID, 2, acc);
+        HGDIOBJ op = SelectObject(dc, pen);
+        HGDIOBJ ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Rectangle(dc, rc->left + 2, rc->top + 1, rc->right - 1, rc->bottom - 1);
+        SelectObject(dc, op); SelectObject(dc, ob);
+        DeleteObject(pen);
+    }
+
+    /* Inner padding for the terminal text — gives the content room from the
+     * window edge instead of touching it. 20 px horizontal, 14 px vertical
+     * (top/bottom). Reflected in both grid sizing and pixel drawing. */
+    const int TERM_PAD_X = 20;
+    const int TERM_PAD_Y = 14;
+
+    int areaW = (rc->right - rc->left) - 2 * TERM_PAD_X;
+    int areaH = (rc->bottom - rc->top) - 2 * TERM_PAD_Y;
+    if (g_app.cellW == 0 || g_app.cellH == 0) measure_cell(dc);
+    int cols = max_int(20, areaW / max_int(1, g_app.cellW));
+    int rows = max_int(5,  areaH / max_int(1, g_app.cellH));
+    cols = min_int(cols, MAX_COLS);
+    rows = min_int(rows, MAX_ROWS);
+    if (cols != t->grid.cols || rows != t->grid.rows) {
+        terminal_grid_resize(&t->grid, cols, rows);
+        if (t->session) session_resize(t->session, cols, rows);
+    }
+
+    HFONT old = (HFONT)SelectObject(dc, g_app.hFontMono);
+    SetBkMode(dc, OPAQUE);
+
+    int baseX = rc->left + TERM_PAD_X;
+    int baseY = rc->top  + TERM_PAD_Y;
+
+    for (int r = 0; r < rows; ++r) {
+        int y = baseY + r * g_app.cellH;
+        for (int c = 0; c < cols; ++c) {
+            const Cell* cell = &t->grid.cells[r * cols + c];
+            COLORREF fg = resolve_fg(cell);
+            COLORREF bg = resolve_bg(cell);
+            if (cell->attr & ATTR_REVERSE) { COLORREF tmp = fg; fg = bg; bg = tmp; }
+            int x = baseX + c * g_app.cellW;
+
+            /* bg fill if needed */
+            if (bg != sc->bg) {
+                RECT bgR = { x, y, x + g_app.cellW, y + g_app.cellH };
+                fill_rect_color(dc, &bgR, bg);
+            }
+            if (cell->ch != L' ' && cell->ch != 0) {
+                HFONT useFont = (cell->attr & ATTR_BOLD) ? g_app.hFontMonoBold : g_app.hFontMono;
+                HFONT prev = (HFONT)SelectObject(dc, useFont);
+                SetTextColor(dc, fg);
+                SetBkColor(dc, bg);
+                TextOutW(dc, x, y, &cell->ch, 1);
+                SelectObject(dc, prev);
+            }
+        }
+    }
+
+    /* Cursor */
+    int cx = baseX + t->grid.cursorCol * g_app.cellW;
+    int cy = baseY + t->grid.cursorRow * g_app.cellH;
+    RECT cur = { cx, cy, cx + g_app.cellW, cy + g_app.cellH };
+    HBRUSH cb = CreateSolidBrush(sc->cursor);
+    FrameRect(dc, &cur, cb);
+    DeleteObject(cb);
+
+    SelectObject(dc, old);
+
+    t->grid.dirty = 0;
+}
+
+/* Resolve a SplitCell (percent coords) against a pixel rect. We round in a
+ * way that the rightmost / bottommost cell always reaches the edge of the
+ * workspace, avoiding 1px gaps. */
+static RECT split_cell_rect(const RECT* parent, const SplitCell* c) {
+    int W = parent->right - parent->left;
+    int H = parent->bottom - parent->top;
+    RECT r;
+    r.left   = parent->left + W * c->x / 100;
+    r.top    = parent->top  + H * c->y / 100;
+    r.right  = (c->x + c->w >= 100) ? parent->right  : parent->left + W * (c->x + c->w) / 100;
+    r.bottom = (c->y + c->h >= 100) ? parent->bottom : parent->top  + H * (c->y + c->h) / 100;
+    /* Inset 2px between adjacent cells so the divider is visible */
+    if (c->x + c->w < 100) r.right -= 2;
+    if (c->y + c->h < 100) r.bottom -= 2;
+    return r;
+}
+
+static void draw_terminal(HDC dc, const RECT* rc) {
+    if (g_app.splitLayout == PRESET_SINGLE) {
+        draw_terminal_cell(dc, rc, g_app.activeTab, TRUE);
+        return;
+    }
+    const SplitPreset* preset = &kPresets[g_app.splitLayout];
+    for (int i = 0; i < preset->cellCount; ++i) {
+        RECT cellRc = split_cell_rect(rc, &preset->cells[i]);
+        int tabIdx = g_app.splitSlots[i];
+        draw_terminal_cell(dc, &cellRc, tabIdx, i == g_app.splitActiveCell);
+    }
+}
+
+/* ---------- Toolbar (AI launchers) ---------- */
+
+typedef struct {
+    const wchar_t* icon;
+    const wchar_t* label;
+    const wchar_t* command;   /* may be NULL for built-in actions */
+    COLORREF color;
+    int action;               /* 0 = inject command + \r, 1 = clear line, 2 = mic stub, 3 = explain stub */
+} ToolbarAction;
+
+static const ToolbarAction kToolbarActions[] = {
+    { L"\U0001F916", L"Claude",   L"claude",  RGB(0xD9, 0x76, 0x06), 0 },
+    { L"✨",     L"Gemini",   L"gemini",  RGB(0x1F, 0x77, 0xFF), 0 },
+    { L"\U0001F9EA", L"Codex",    L"codex",   RGB(0x16, 0xA3, 0x4A), 0 },
+    { L"\U0001F3A4", L"Voz",      NULL,       RGB(0xF7, 0x76, 0x8E), 2 },
+    { L"✂",     L"Limpar",   NULL,       RGB(0xC0, 0xCA, 0xF5), 1 },
+    { L"\U0001F4A1", L"Explicar", NULL,       RGB(0xE0, 0xAF, 0x68), 3 },
+    { L"▦",     L"Layout",   NULL,       RGB(0xBB, 0x9A, 0xF7), 5 },
+    { L"⚙",     L"Config",   NULL,       RGB(0x7A, 0xA2, 0xF7), 4 },
+};
+#define TOOLBAR_ACTION_COUNT (sizeof(kToolbarActions)/sizeof(kToolbarActions[0]))
+
+static void toolbar_action_rect(int idx, const RECT* rc, RECT* out) {
+    int btnW = 110;
+    int gap = 6;
+    int x = rc->left + 10 + idx * (btnW + gap);
+    out->left = x; out->right = x + btnW;
+    out->top = rc->top + 4; out->bottom = rc->bottom - 4;
+}
+
+static void draw_toolbar(HDC dc, const RECT* rc) {
+    fill_rect_color(dc, rc, COL_BG_SIDE);
+    RECT divTop = { rc->left, rc->top, rc->right, rc->top + 1 };
+    fill_rect_color(dc, &divTop, COL_DIV);
+
+    for (size_t i = 0; i < TOOLBAR_ACTION_COUNT; ++i) {
+        RECT br;
+        toolbar_action_rect((int)i, rc, &br);
+
+        /* Mic button changes color + label while recording */
+        BOOL micRecording = (kToolbarActions[i].action == 2 && g_voice.recording);
+        BOOL micUploading = (kToolbarActions[i].action == 2 && g_voice.uploading);
+
+        COLORREF bg = COL_BG_CHIP;
+        COLORREF border = COL_DIV;
+        if (micRecording) { bg = RGB(0x66, 0x1A, 0x22); border = RGB(0xF7, 0x76, 0x8E); }
+        else if (micUploading) { bg = RGB(0x1A, 0x40, 0x66); border = RGB(0x7A, 0xA2, 0xF7); }
+
+        draw_rounded_rect(dc, br, bg, border, 8);
+
+        SIZE sz;
+        HFONT old = (HFONT)SelectObject(dc, g_app.hFontEmoji);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, kToolbarActions[i].color);
+        GetTextExtentPoint32W(dc, kToolbarActions[i].icon, (int)wcslen(kToolbarActions[i].icon), &sz);
+        int iconY = br.top + ((br.bottom - br.top) - sz.cy) / 2;
+        TextOutW(dc, br.left + 10, iconY, kToolbarActions[i].icon, (int)wcslen(kToolbarActions[i].icon));
+
+        SelectObject(dc, g_app.hFontUI);
+        SetTextColor(dc, COL_FG);
+        wchar_t label[64];
+        if (micRecording) {
+            int sec = (int)((GetTickCount() - g_voice.startTick) / 1000);
+            _snwprintf_s(label, 64, _TRUNCATE, L"REC %02d:%02d", sec / 60, sec % 60);
+        } else if (micUploading) {
+            wcscpy_s(label, 64, L"Enviando…");
+        } else {
+            wcscpy_s(label, 64, kToolbarActions[i].label);
+        }
+        TextOutW(dc, br.left + 34, br.top + 7, label, (int)wcslen(label));
+        SelectObject(dc, old);
+    }
+}
+
+/* =========================================================================
+ *                           STATUS BAR
+ * ========================================================================= */
+
+static void update_status(void) {
+    wchar_t s[256];
+    PROCESS_MEMORY_COUNTERS_EX pmc = {0};
+    pmc.cb = sizeof(pmc);
+    GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc));
+    double mb = (double)pmc.PrivateUsage / (1024.0 * 1024.0);
+    Tab* t = (g_app.activeTab >= 0 && g_app.activeTab < g_app.tabCount) ? g_app.tabs[g_app.activeTab] : NULL;
+    const wchar_t* shell = (t && t->session) ? t->session->shellName : L"—";
+    const wchar_t* cwd   = (t && t->session && t->session->cwd[0]) ? t->session->cwd : L"~";
+
+    _snwprintf_s(s, 256, _TRUNCATE,
+                 L"Dante CLI %s   ·   %s   ·   %s   ·   RAM %.1f MB",
+                 APP_VERSION_W, shell, cwd, mb);
+    if (g_app.hStatus) SendMessageW(g_app.hStatus, SB_SETTEXTW, 0, (LPARAM)s);
+}
+
+/* =========================================================================
+ *                           HIT TESTING
+ * ========================================================================= */
+
+static int hit_test_tab(int x, int y, const RECT* rc) {
+    if (y < rc->top || y > rc->bottom) return -1;
+    for (int i = 0; i < g_app.tabCount; ++i) {
+        int cx = tab_chip_x(i);
+        if (x >= cx && x < cx + 146) return i;
+    }
+    return -1;
+}
+static int hit_test_tab_close(int x, int y, const RECT* rc, int idx) {
+    if (idx < 0 || idx >= g_app.tabCount) return 0;
+    int cx = tab_chip_x(idx);
+    RECT closeR = { cx + 146 - 24, rc->top + 11, cx + 146 - 4, rc->top + 28 };
+    return (x >= closeR.left && x < closeR.right && y >= closeR.top && y < closeR.bottom);
+}
+static int hit_test_new_tab(int x, int y, const RECT* rc) {
+    int px = tab_chip_x(g_app.tabCount) + 4;
+    return (x >= px && x < px + 32 && y >= rc->top + 7 && y < rc->bottom - 7);
+}
+
+static int hit_test_sidebar_mode(int x, int y, const RECT* rc) {
+    for (int i = 0; i < MODE_COUNT; ++i) {
+        RECT br; sidebar_mode_button_rect(i, rc, &br);
+        if (x >= br.left && x < br.right && y >= br.top && y < br.bottom) return i;
+    }
+    return -1;
+}
+static int hit_test_sidebar_item(int x, int y, const RECT* rc) {
+    int top = rc->top + SIDEBAR_HDR_H + 76;   /* y where item list starts */
+    int rowH = 46;
+    int bottom = rc->bottom - 48;
+    if (x < rc->left + 12 || x > rc->right - 12) return -1;
+    if (y < top || y >= bottom) return -1;
+    int idx = (y - top) / rowH;
+    int count = 0;
+    if (g_app.sidebarMode == MODE_FAVORITES) count = g_app.favoriteCount;
+    else if (g_app.sidebarMode == MODE_SNIPPETS) count = g_app.snippetCount;
+    else if (g_app.sidebarMode == MODE_CREDS)    count = g_app.credCount;
+    if (idx < 0 || idx >= count) return -1;
+    return idx;
+}
+
+static int hit_test_sidebar_add(int x, int y, const RECT* rc) {
+    return (x >= rc->left + 12 && x < rc->right - 12 &&
+            y >= rc->bottom - 44 && y < rc->bottom - 12);
+}
+
+static void on_sidebar_item_activated(int idx) {
+    if (idx < 0) return;
+    if (g_app.sidebarMode == MODE_FAVORITES && idx < g_app.favoriteCount) {
+        wchar_t buf[1024];
+        _snwprintf_s(buf, 1024, _TRUNCATE, L"cd \"%s\"\r", g_app.favorites[idx].path);
+        inject_into_active(buf);
+    } else if (g_app.sidebarMode == MODE_SNIPPETS && idx < g_app.snippetCount) {
+        /* Snippets do NOT auto-press Enter — user reviews before running */
+        inject_into_active(g_app.snippets[idx].cmd);
+    } else if (g_app.sidebarMode == MODE_CREDS && idx < g_app.credCount) {
+        Credential* c = &g_app.creds[idx];
+        wchar_t buf[2048];
+        _snwprintf_s(buf, 2048, _TRUNCATE,
+            L"# === Credencial: %s (%s) ===\r"
+            L"# user: %s\r"
+            L"# host: %s\r"
+            L"# === fim ===\r",
+            c->name, c->kind, c->user, c->host);
+        inject_into_active(buf);
+    }
+}
+
+static int hit_test_toolbar_action(int x, int y, const RECT* rc) {
+    for (int i = 0; i < (int)TOOLBAR_ACTION_COUNT; ++i) {
+        RECT br; toolbar_action_rect(i, rc, &br);
+        if (x >= br.left && x < br.right && y >= br.top && y < br.bottom) return i;
+    }
+    return -1;
+}
+
+/* =========================================================================
+ *                          MESSAGE LOOP
+ * ========================================================================= */
+
+static void send_key_text(const char* s) {
+    int idx = active_tab_index();
+    if (idx < 0 || idx >= g_app.tabCount) return;
+    Tab* t = g_app.tabs[idx];
+    if (!t || !t->session) return;
+    session_write(t->session, s, (int)strlen(s));
+}
+
+static void on_keypress(WPARAM wParam, LPARAM lParam) {
+    (void)lParam;
+    int idx = active_tab_index();
+    if (idx < 0 || idx >= g_app.tabCount) return;
+    Tab* t = g_app.tabs[idx];
+    if (!t || !t->session) return;
+
+    BOOL ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    BOOL alt  = (GetKeyState(VK_MENU)    & 0x8000) != 0;
+
+    if (ctrl && wParam >= 'A' && wParam <= 'Z') {
+        char ctrlByte = (char)(wParam - 'A' + 1);
+        session_write(t->session, &ctrlByte, 1);
+        return;
+    }
+
+    /* Backspace family:
+     *   - Backspace        → DEL (0x7F)  ⇒ PSReadLine BackwardDeleteChar
+     *   - Ctrl+Backspace   → ETB (0x17)  ⇒ PSReadLine BackwardKillWord
+     *   - Alt+Backspace    → ESC + DEL   ⇒ word boundary variant
+     * 0x7F is what xterm/Windows Terminal/PSReadLine all expect for a
+     * single-char erase; older 0x08 (BS) was triggering BackwardKillWord
+     * in some PSReadLine binds and erased a whole word.                  */
+    if (wParam == VK_BACK) {
+        if (ctrl)      { char b = 0x17; session_write(t->session, &b, 1); }
+        else if (alt)  { session_write(t->session, "\x1B\x7F", 2); }
+        else           { char b = 0x7F; session_write(t->session, &b, 1); }
+        return;
+    }
+
+    switch (wParam) {
+        case VK_RETURN: send_key_text("\r"); break;
+        case VK_TAB:    send_key_text("\t"); break;
+        case VK_ESCAPE: send_key_text("\x1B"); break;
+        case VK_UP:     send_key_text("\x1B[A"); break;
+        case VK_DOWN:   send_key_text("\x1B[B"); break;
+        case VK_RIGHT:  send_key_text("\x1B[C"); break;
+        case VK_LEFT:   send_key_text("\x1B[D"); break;
+        case VK_HOME:   send_key_text("\x1B[H"); break;
+        case VK_END:    send_key_text("\x1B[F"); break;
+        case VK_DELETE: send_key_text("\x1B[3~"); break;
+        case VK_PRIOR:  send_key_text("\x1B[5~"); break;
+        case VK_NEXT:   send_key_text("\x1B[6~"); break;
+    }
+}
+
+static void on_char(WPARAM wParam) {
+    int idx = active_tab_index();
+    if (idx < 0) return;
+    BOOL ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+    if (ctrl) return; /* handled in keydown */
+
+    wchar_t wc = (wchar_t)wParam;
+
+    /* TranslateMessage produces a WM_CHAR for every WM_KEYDOWN with a
+     * printable mapping, including CR (0x0D), TAB (0x09), BS (0x08) and
+     * ESC (0x1B). on_keypress() already sent those — bail out here to
+     * avoid the duplicate byte that produced "²", phantom prompts, and
+     * Backspace eating two characters. Also drop any other C0 control
+     * (Ctrl+letter is handled in on_keypress).                         */
+    if (wc < 0x20 || wc == 0x7F) return;
+
+    char utf[8] = {0};
+    int n = WideCharToMultiByte(CP_UTF8, 0, &wc, 1, utf, sizeof(utf), NULL, NULL);
+    if (n > 0) {
+        Tab* t = g_app.tabs[idx];
+        if (t && t->session) session_write(t->session, utf, n);
+    }
+}
+
+static void perform_toolbar_action(int idx) {
+    if (idx < 0 || idx >= (int)TOOLBAR_ACTION_COUNT) return;
+    const ToolbarAction* a = &kToolbarActions[idx];
+    switch (a->action) {
+        case 0: {
+            wchar_t buf[128];
+            _snwprintf_s(buf, 128, _TRUNCATE, L"%s\r", a->command);
+            inject_into_active(buf);
+            break;
+        }
+        case 1: send_key_text("\x15"); break;  /* Ctrl-U */
+        case 2:
+            voice_toggle();
+            break;
+        case 3:
+            groq_explain_active_terminal();
+            break;
+        case 4:
+            show_settings_dialog();
+            break;
+        case 5: {
+            POINT pt; GetCursorPos(&pt); ScreenToClient(g_app.hWnd, &pt);
+            show_split_menu(g_app.hWnd, pt.x, pt.y);
+            break;
+        }
+    }
+}
+
+static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE: {
+            INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_BAR_CLASSES | ICC_STANDARD_CLASSES };
+            InitCommonControlsEx(&icc);
+            g_app.hWnd = hWnd;
+            g_app.brBg       = CreateSolidBrush(COL_BG);
+            g_app.brBgSide   = CreateSolidBrush(COL_BG_SIDE);
+            g_app.brBgTabBar = CreateSolidBrush(COL_BG_TABBAR);
+            g_app.brBgTerm   = CreateSolidBrush(COL_BG_TERM);
+            g_app.brBgStatus = CreateSolidBrush(COL_BG_STATUS);
+            g_app.brBgChip   = CreateSolidBrush(COL_BG_CHIP);
+            g_app.brBgChipH  = CreateSolidBrush(COL_BG_CHIP_H);
+            g_app.brAccent   = CreateSolidBrush(COL_ACCENT);
+            g_app.penDiv     = CreatePen(PS_SOLID, 1, COL_DIV);
+            g_app.penAccent  = CreatePen(PS_SOLID, 2, COL_ACCENT);
+
+            g_app.hFontUI = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+            g_app.hFontMono = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                          CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Cascadia Code");
+            g_app.hFontMonoBold = CreateFontW(-16, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                              CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Cascadia Code");
+            g_app.hFontEmoji = CreateFontW(-18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                           CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI Emoji");
+            g_app.hFontBig = CreateFontW(-22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                                         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+
+            g_app.hStatus = CreateWindowExW(0, STATUSCLASSNAMEW, NULL,
+                                            WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
+                                            0, 0, 0, 0,
+                                            hWnd, (HMENU)IDC_STATIC, GetModuleHandleW(NULL), NULL);
+
+            InitializeCriticalSection(&g_app.lock);
+            voice_init();
+
+            g_app.statsTimer = SetTimer(hWnd, 1, 2000, NULL);
+            g_app.repaintTimer = SetTimer(hWnd, 2, 33, NULL);
+            g_app.persistTimer = SetTimer(hWnd, 3, 1500, NULL);
+            g_app.dragTabIdx = -1;
+            g_app.tabBarHoverIdx = -1;
+            g_app.sidebarHoverIdx = -1;
+            g_app.sidebarItemHoverIdx = -1;
+            for (int i = 0; i < MAX_SPLIT_CELLS; ++i) g_app.splitSlots[i] = -1;
+            g_app.splitLayout = PRESET_SINGLE;
+            g_app.splitActiveCell = 0;
+
+            return 0;
+        }
+
+        case WM_SIZE: {
+            if (g_app.hStatus) SendMessageW(g_app.hStatus, WM_SIZE, 0, 0);
+            return 0;
+        }
+
+        case WM_ERASEBKGND: return 1;
+
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hWnd, &ps);
+
+            RECT cli; GetClientRect(hWnd, &cli);
+            HDC mem = CreateCompatibleDC(hdc);
+            HBITMAP bmp = CreateCompatibleBitmap(hdc, cli.right, cli.bottom);
+            HBITMAP oldBmp = (HBITMAP)SelectObject(mem, bmp);
+
+            RECT sideRc, tabRc, termRc, toolbarRc, statusRc;
+            layout_compute(&sideRc, &tabRc, &termRc, &toolbarRc, &statusRc);
+
+            fill_rect_color(mem, &cli, COL_BG);
+            draw_sidebar(mem, &sideRc);
+            draw_tabbar(mem, &tabRc);
+            draw_terminal(mem, &termRc);
+            draw_toolbar(mem, &toolbarRc);
+
+            if (g_app.cheatsheetVisible) draw_cheatsheet(mem, &cli);
+
+            BitBlt(hdc, 0, 0, cli.right, cli.bottom, mem, 0, 0, SRCCOPY);
+
+            SelectObject(mem, oldBmp);
+            DeleteObject(bmp);
+            DeleteDC(mem);
+
+            EndPaint(hWnd, &ps);
+            return 0;
+        }
+
+        case WM_LBUTTONDOWN: {
+            int x = LOWORD(lParam), y = HIWORD(lParam);
+            RECT sideRc, tabRc, termRc, toolbarRc, statusRc;
+            layout_compute(&sideRc, &tabRc, &termRc, &toolbarRc, &statusRc);
+
+            if (g_app.cheatsheetVisible) { cheatsheet_toggle(); return 0; }
+
+            int mode = hit_test_sidebar_mode(x, y, &sideRc);
+            if (mode >= 0) { g_app.sidebarMode = (SidebarMode)mode; InvalidateRect(hWnd, NULL, FALSE); return 0; }
+
+            if (hit_test_sidebar_add(x, y, &sideRc)) { show_add_dialog(); return 0; }
+
+            int sItem = hit_test_sidebar_item(x, y, &sideRc);
+            if (sItem >= 0) { on_sidebar_item_activated(sItem); return 0; }
+
+            int tab = hit_test_tab(x, y, &tabRc);
+            if (tab >= 0) {
+                if (hit_test_tab_close(x, y, &tabRc, tab)) { close_tab(tab); return 0; }
+                g_app.activeTab = tab;
+                g_app.dragTabIdx = tab;
+                g_app.dragStartX = x;
+                g_app.dragOffsetX = x - tab_chip_x(tab);
+                SetCapture(hWnd);
+                InvalidateRect(hWnd, NULL, FALSE);
+                update_status();
+                return 0;
+            }
+            if (hit_test_new_tab(x, y, &tabRc)) { open_new_tab(L"powershell"); return 0; }
+
+            int act = hit_test_toolbar_action(x, y, &toolbarRc);
+            if (act >= 0) { perform_toolbar_action(act); return 0; }
+
+            /* Click inside terminal area + split → activate the cell */
+            if (g_app.splitLayout != PRESET_SINGLE &&
+                x >= termRc.left && x < termRc.right &&
+                y >= termRc.top && y < termRc.bottom) {
+                const SplitPreset* preset = &kPresets[g_app.splitLayout];
+                for (int i = 0; i < preset->cellCount; ++i) {
+                    RECT cellRc = split_cell_rect(&termRc, &preset->cells[i]);
+                    if (x >= cellRc.left && x < cellRc.right &&
+                        y >= cellRc.top && y < cellRc.bottom) {
+                        g_app.splitActiveCell = i;
+                        InvalidateRect(hWnd, NULL, FALSE);
+                        update_status();
+                        break;
+                    }
+                }
+            }
+
+            SetFocus(hWnd);
+            return 0;
+        }
+
+        case WM_LBUTTONUP: {
+            if (g_app.dragTabIdx >= 0) {
+                ReleaseCapture();
+                int x = LOWORD(lParam), y = HIWORD(lParam);
+                RECT sideRc, tabRc, termRc, toolbarRc, statusRc;
+                layout_compute(&sideRc, &tabRc, &termRc, &toolbarRc, &statusRc);
+                int target = hit_test_tab(x, y, &tabRc);
+                if (target >= 0 && target != g_app.dragTabIdx) {
+                    Tab* moving = g_app.tabs[g_app.dragTabIdx];
+                    /* shift */
+                    if (target > g_app.dragTabIdx) {
+                        for (int i = g_app.dragTabIdx; i < target; ++i) g_app.tabs[i] = g_app.tabs[i + 1];
+                    } else {
+                        for (int i = g_app.dragTabIdx; i > target; --i) g_app.tabs[i] = g_app.tabs[i - 1];
+                    }
+                    g_app.tabs[target] = moving;
+                    g_app.activeTab = target;
+                    schedule_persist();
+                }
+                g_app.dragTabIdx = -1;
+                InvalidateRect(hWnd, NULL, FALSE);
+            }
+            return 0;
+        }
+
+        case WM_LBUTTONDBLCLK: {
+            int x = LOWORD(lParam), y = HIWORD(lParam);
+            RECT sideRc, tabRc, termRc, toolbarRc, statusRc;
+            layout_compute(&sideRc, &tabRc, &termRc, &toolbarRc, &statusRc);
+            int tab = hit_test_tab(x, y, &tabRc);
+            if (tab >= 0) {
+                wchar_t newName[128] = {0};
+                str_copy_w(newName, 128, g_app.tabs[tab]->title);
+                if (prompt_text(L"Renomear aba", L"Novo título:", newName, 128)) {
+                    str_copy_w(g_app.tabs[tab]->title, 128, newName);
+                    schedule_persist();
+                    InvalidateRect(hWnd, NULL, FALSE);
+                }
+            }
+            return 0;
+        }
+
+        case WM_RBUTTONUP: {
+            int x = LOWORD(lParam), y = HIWORD(lParam);
+            RECT sideRc, tabRc, termRc, toolbarRc, statusRc;
+            layout_compute(&sideRc, &tabRc, &termRc, &toolbarRc, &statusRc);
+            int tab = hit_test_tab(x, y, &tabRc);
+            if (tab >= 0) show_tab_context_menu(hWnd, tab, x, y);
+            return 0;
+        }
+
+        case WM_MOUSEMOVE: {
+            int x = LOWORD(lParam), y = HIWORD(lParam);
+            RECT sideRc, tabRc, termRc, toolbarRc, statusRc;
+            layout_compute(&sideRc, &tabRc, &termRc, &toolbarRc, &statusRc);
+            int newHoverTab = hit_test_tab(x, y, &tabRc);
+            int newHoverSide = hit_test_sidebar_mode(x, y, &sideRc);
+            int newHoverItem = hit_test_sidebar_item(x, y, &sideRc);
+            if (newHoverTab != g_app.tabBarHoverIdx ||
+                newHoverSide != g_app.sidebarHoverIdx ||
+                newHoverItem != g_app.sidebarItemHoverIdx) {
+                g_app.tabBarHoverIdx = newHoverTab;
+                g_app.sidebarHoverIdx = newHoverSide;
+                g_app.sidebarItemHoverIdx = newHoverItem;
+                InvalidateRect(hWnd, NULL, FALSE);
+            }
+            return 0;
+        }
+
+        case WM_KEYDOWN: {
+            /* Global shortcuts before forwarding to PTY */
+            BOOL ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            BOOL shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            if (ctrl && wParam == VK_OEM_2) { cheatsheet_toggle(); return 0; }    /* Ctrl+/ */
+            if (ctrl && wParam == VK_OEM_COMMA) { show_settings_dialog(); return 0; }  /* Ctrl+, */
+            if (wParam == VK_F1) { show_about(); return 0; }
+            if (ctrl && wParam == 'D' && !shift) { duplicate_tab(g_app.activeTab); return 0; }
+            if (g_app.cheatsheetVisible && wParam == VK_ESCAPE) { cheatsheet_toggle(); return 0; }
+            if (ctrl && wParam == 'T' && !shift) { open_new_tab(L"powershell"); return 0; }
+            if (ctrl && wParam == 'W' && !shift) {
+                if (g_app.activeTab >= 0) close_tab(g_app.activeTab);
+                return 0;
+            }
+            if (ctrl && wParam == VK_TAB) {
+                if (g_app.tabCount > 0) {
+                    int next = (g_app.activeTab + (shift ? -1 : 1) + g_app.tabCount) % g_app.tabCount;
+                    g_app.activeTab = next;
+                    InvalidateRect(hWnd, NULL, FALSE);
+                    update_status();
+                }
+                return 0;
+            }
+            if (ctrl && wParam >= '1' && wParam <= '9') {
+                int idx = (int)(wParam - '1');
+                if (idx < g_app.tabCount) {
+                    g_app.activeTab = idx;
+                    InvalidateRect(hWnd, NULL, FALSE);
+                    update_status();
+                }
+                return 0;
+            }
+            on_keypress(wParam, lParam);
+            return 0;
+        }
+        case WM_SYSKEYDOWN: {
+            /* Alt+key. We only intercept Alt+Backspace; everything else
+             * (Alt+F4, Alt-menu accelerators) goes to DefWindowProc.  */
+            if (wParam == VK_BACK) {
+                on_keypress(wParam, lParam);
+                return 0;
+            }
+            break;
+        }
+        case WM_CHAR:    on_char(wParam); return 0;
+        case WM_SYSCHAR:
+            /* Suppress the system bell when Alt+key has been handled. */
+            if (wParam == VK_BACK) return 0;
+            break;
+
+        case WM_TIMER:
+            if (wParam == 1) {
+                update_status();
+            } else if (wParam == 2) {
+                if (g_app.pendingRepaint) { g_app.pendingRepaint = 0; InvalidateRect(hWnd, NULL, FALSE); }
+            } else if (wParam == 3) {
+                if (g_app.pendingPersist) { g_app.pendingPersist = 0; persist_save(); }
+            }
+            return 0;
+
+        case WM_DANTE_UPDATE_RESULT: {
+            wchar_t* remote = (wchar_t*)lParam;
+            if (remote && wcscmp(remote, APP_VERSION_W) > 0) {
+                wchar_t msg[512];
+                _snwprintf_s(msg, 512, _TRUNCATE,
+                    L"Há uma versão nova disponível!\n\n"
+                    L"Sua versão: %s\n"
+                    L"Disponível: %s\n\n"
+                    L"Abrir página de download?",
+                    APP_VERSION_W, remote);
+                if (MessageBoxW(g_app.hWnd, msg, APP_NAME_W,
+                                MB_ICONINFORMATION | MB_YESNO) == IDYES) {
+                    ShellExecuteW(g_app.hWnd, L"open",
+                        L"https://github.com/dantetesta/dante-cli/releases/latest",
+                        NULL, NULL, SW_SHOWNORMAL);
+                }
+            }
+            free(remote);
+            return 0;
+        }
+
+        case WM_DANTE_VOICE_DONE: {
+            g_voice.uploading = FALSE;
+            wchar_t* text = (wchar_t*)lParam;
+            if (text && text[0]) {
+                size_t L = wcslen(text);
+                wchar_t* withCr = (wchar_t*)malloc((L + 4) * sizeof(wchar_t));
+                wcscpy_s(withCr, L + 4, text);
+                wcscat_s(withCr, L + 4, L" ");
+                inject_into_active(withCr);
+                free(withCr);
+            }
+            free(text);
+            InvalidateRect(g_app.hWnd, NULL, FALSE);
+            return 0;
+        }
+        case WM_DANTE_VOICE_ERROR: {
+            g_voice.uploading = FALSE;
+            wchar_t* msg = (wchar_t*)lParam;
+            MessageBoxW(g_app.hWnd, msg, APP_NAME_W, MB_ICONERROR);
+            free(msg);
+            InvalidateRect(g_app.hWnd, NULL, FALSE);
+            return 0;
+        }
+
+        case WM_DANTE_GROQ_RESULT: {
+            g_groqInFlight = FALSE;
+            wchar_t* text = (wchar_t*)lParam;
+            show_groq_result(L"Explicação (Groq)", text);
+            return 0;
+        }
+        case WM_DANTE_GROQ_ERROR: {
+            g_groqInFlight = FALSE;
+            wchar_t* msg = (wchar_t*)lParam;
+            MessageBoxW(g_app.hWnd, msg, APP_NAME_W, MB_ICONERROR);
+            free(msg);
+            return 0;
+        }
+
+        case WM_DANTE_OUTPUT: {
+            char* heap = (char*)lParam;
+            if (!heap) return 0;
+            int tabId = *(int*)heap;
+            int n     = *(int*)(heap + sizeof(int));
+            const char* bytes = heap + sizeof(int) * 2;
+
+            /* Find tab by stable id — Session* could be dangling if the tab
+             * was closed between the post and the dispatch.                */
+            Tab* target = NULL;
+            for (int i = 0; i < g_app.tabCount; ++i) {
+                if (g_app.tabs[i] && g_app.tabs[i]->id == tabId) {
+                    target = g_app.tabs[i]; break;
+                }
+            }
+            if (target) {
+                parser_feed(target, bytes, n);
+                g_app.pendingRepaint = 1;
+            }
+            free(heap);
+            return 0;
+        }
+
+        case WM_QUERYENDSESSION:
+            /* Logoff / shutdown — save now and allow the close to proceed. */
+            persist_save();
+            return TRUE;
+        case WM_ENDSESSION:
+            if (wParam) persist_save();
+            return 0;
+
+        case WM_DESTROY:
+            persist_save();
+            for (int i = 0; i < g_app.tabCount; ++i) {
+                if (g_app.tabs[i]) {
+                    session_destroy(g_app.tabs[i]->session);
+                    terminal_grid_free(&g_app.tabs[i]->grid);
+                    free(g_app.tabs[i]);
+                    g_app.tabs[i] = NULL;
+                }
+            }
+            g_app.tabCount = 0;
+            DeleteObject(g_app.brBg);
+            DeleteObject(g_app.brBgSide);
+            DeleteObject(g_app.brBgTabBar);
+            DeleteObject(g_app.brBgTerm);
+            DeleteObject(g_app.brBgStatus);
+            DeleteObject(g_app.brBgChip);
+            DeleteObject(g_app.brBgChipH);
+            DeleteObject(g_app.brAccent);
+            DeleteObject(g_app.penDiv);
+            DeleteObject(g_app.penAccent);
+            DeleteObject(g_app.hFontUI);
+            DeleteObject(g_app.hFontMono);
+            DeleteObject(g_app.hFontMonoBold);
+            DeleteObject(g_app.hFontEmoji);
+            DeleteObject(g_app.hFontBig);
+            DeleteCriticalSection(&g_app.lock);
+            PostQuitMessage(0);
+            return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+/* =========================================================================
+ *                              ENTRY POINT
+ * ========================================================================= */
+
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int nShow) {
+    (void)hPrev; (void)cmd;
+
+    if (!load_conpty_apis()) {
+        MessageBoxW(NULL,
+            L"ConPTY não está disponível.\n\nWindows 10 versão 1809 (build 17763) ou Windows 11 é obrigatório.\n\nAtualize o sistema e tente novamente.",
+            APP_NAME_W, MB_ICONERROR);
+        return 1;
+    }
+
+    WNDCLASSEXW wc = { sizeof(wc) };
+    wc.style         = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+    wc.lpfnWndProc   = WndProc;
+    wc.hInstance     = hInst;
+    wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+    wc.hbrBackground = NULL;
+    wc.lpszClassName = APP_WINDOW_CLS;
+    wc.hIcon         = LoadIconW(hInst, L"DanteIcon");
+    wc.hIconSm       = LoadIconW(hInst, L"DanteIcon");
+    RegisterClassExW(&wc);
+
+    int sw = GetSystemMetrics(SM_CXSCREEN);
+    int sh = GetSystemMetrics(SM_CYSCREEN);
+    int W = min_int(1280, sw - 100);
+    int H = min_int(800,  sh - 100);
+
+    HWND hWnd = CreateWindowExW(
+        WS_EX_APPWINDOW,
+        APP_WINDOW_CLS,
+        APP_NAME_W,
+        WS_OVERLAPPEDWINDOW,
+        (sw - W) / 2, (sh - H) / 2, W, H,
+        NULL, NULL, hInst, NULL);
+    if (!hWnd) return 2;
+
+    persist_load();
+    if (g_app.tabCount == 0) open_new_tab(L"powershell");
+    else g_app.activeTab = 0;
+
+    ShowWindow(hWnd, nShow);
+    UpdateWindow(hWnd);
+    update_status();
+    check_for_updates_async();
+
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    return (int)msg.wParam;
+}

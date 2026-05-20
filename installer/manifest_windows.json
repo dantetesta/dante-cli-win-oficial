@@ -1,0 +1,30 @@
+{
+  "_comment": "Dante CLI — manifest de update do canal Windows. Coloque este arquivo num endpoint HTTPS público (ex: https://dantetesta.com.br/dante-cli/manifest_windows.json) e configure a URL em ⚙ Configurações → 'URL do manifest de update' dentro do app.",
+
+  "schema_version": 1,
+  "channel": "stable",
+
+  "version": "1.0.11",
+  "url": "https://dantetesta.com.br/dante-cli/DanteCLI-Setup-1.0.11-x64.exe",
+  "size_bytes": 867328,
+  "sha256": "",
+
+  "release_date": "2026-05-20",
+  "min_os_build": 17763,
+
+  "notes": "Versão 1.0.11 — Sistema de update agora suporta manifest customizado.\n\nCorrigido:\n- Caracteres duplicados ao digitar (Enter/Tab/Backspace eram enviados 2x ao ConPTY).\n- Backspace agora envia 0x08 (BS) em vez de 0x7F (DEL).\n\nAdicionado:\n- URL do manifest configurável em ⚙ Configurações.\n- Botão 'Baixar e instalar' direto no aviso de nova versão.",
+
+  "release_url": "https://dantetesta.com.br/dante-cli/releases/1.0.11",
+
+  "_schema_doc": {
+    "version":        "string SemVer (X.Y.Z). O app compara lexicograficamente: se for > APP_VERSION local, oferece update.",
+    "url":            "URL HTTPS direta do .exe do instalador NSIS. O app baixa para %TEMP%\\DanteCLI-Setup-X.Y.Z.exe e executa.",
+    "size_bytes":     "Opcional. Se informado, o app pré-aloca/valida; se mismatch, aborta.",
+    "sha256":         "Opcional. Se informado, o app valida o .exe baixado antes de executar. Deixe vazio para desabilitar.",
+    "release_date":   "Opcional. ISO 8601 (YYYY-MM-DD).",
+    "min_os_build":   "Opcional. Se a build do Windows do usuário for inferior, o aviso explica que o update não suportará o sistema atual.",
+    "notes":          "Markdown light (\\n para quebra de linha). Mostrado no diálogo de 'nova versão disponível'.",
+    "release_url":    "Opcional. URL da página de release (changelog/blog/etc). 'Ver detalhes' abre ela no navegador.",
+    "channel":        "Opcional. 'stable' | 'beta' | 'dev'. App por padrão lê 'stable'."
+  }
+}
