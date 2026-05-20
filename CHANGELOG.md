@@ -3,6 +3,26 @@
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 Versionamento [SemVer](https://semver.org/lang/pt-BR/).
 
+## [1.0.18] — 2026-05-20
+
+### Adicionado
+- **Galeria visual de layouts** (igual à do macOS) substitui o popup menu de texto. Janela de 960×720 com:
+  - Header com título "Galeria de layouts" e dica de Esc.
+  - 4 **pills de categoria** (Simples / IDE / Dashboard / Operações) — a categoria do layout atual é pré-selecionada.
+  - **Grid de cards 3 colunas**, cada um com:
+    - **Thumbnail real do layout** desenhado dinamicamente a partir das células `{x,y,w,h}` em coordenadas % — cada cell vira um retângulo azul arredondado num canvas dark, com gaps de 2 px entre elas.
+    - Nome do preset em branco.
+    - "N painéis" em cinza.
+  - Card do layout atualmente ativo tem borda azul.
+  - Hover muda o card pra uma cor mais clara.
+- **Navegação por teclado**: ←/→ navegam entre cards, Enter aplica, Esc fecha.
+- Botão **▦ Layout** no toolbar agora abre a galeria. `Shift+click` no botão ainda abre o popup menu de texto (mais rápido para usuários power).
+
+### Detalhes técnicos
+- `gallery_paint_thumbnail()` renderiza as células do preset proporcionalmente em qualquer tamanho de canvas — mesmo código que valida visualmente os 21 presets sem precisar de PNGs/imagens.
+- Janela usa `WS_POPUP | WS_CAPTION | WS_SYSMENU` com double-buffering para evitar flicker.
+- `WM_DESTROY` segue o padrão `PostThreadMessageW(WM_NULL)` (não `PostQuitMessage`) — não mata o app inteiro.
+
 ## [1.0.17] — 2026-05-20
 
 ### Corrigido

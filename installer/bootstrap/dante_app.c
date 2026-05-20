@@ -72,7 +72,7 @@ static PFN_ClosePseudoConsole  pClosePseudoConsole  = NULL;
  *                              CONSTANTS
  * ========================================================================= */
 
-#define APP_VERSION_W   L"1.0.17"
+#define APP_VERSION_W   L"1.0.18"
 #define APP_NAME_W      L"Dante CLI"
 #define APP_WINDOW_CLS  L"DanteCLIMainWindow"
 
@@ -582,6 +582,7 @@ static void draw_cheatsheet(HDC dc, const RECT* cli);
 static void show_settings_dialog(void);
 static void show_split_menu(HWND hWnd, int x, int y);
 static void set_split_layout(int layoutId);
+static void show_layout_gallery(void);
 static void draw_terminal_cell(HDC dc, const RECT* rc, int tabIdx, BOOL hasFocus);
 static int  active_tab_index(void);
 static RECT split_cell_rect(const RECT* parent, const SplitCell* c);
@@ -2017,6 +2018,315 @@ static void set_split_layout(int presetIdx) {
 enum {
     IDM_SPLIT_BASE = 0x1300,   /* +0..PRESET_COUNT-1 */
 };
+
+/* =====================================================================
+ *                       VISUAL LAYOUT GALLERY
+ *
+ * Custom popup window that mirrors the macOS gallery: header with title,
+ * 4 category pills, and a 3-column grid of cards. Each card renders a
+ * miniature of the layout (blue rects on a dark canvas) followed by the
+ * name and "N painéis" subtitle. Click a card → applies the preset.
+ * ===================================================================== */
+
+#define GAL_W            960
+#define GAL_H            720
+#define GAL_HDR_H        72
+#define GAL_PILLS_H      56
+#define GAL_FOOTER_H     44
+#define GAL_CARD_W       280
+#define GAL_CARD_H       190
+#define GAL_CARD_GAP     14
+#define GAL_GRID_PAD     20
+#define GAL_THUMB_W      180
+#define GAL_THUMB_H      100
+
+#define COL_GAL_BG       RGB(0x16, 0x16, 0x1E)
+#define COL_GAL_CARD     RGB(0x1F, 0x23, 0x35)
+#define COL_GAL_CARD_H   RGB(0x2A, 0x2F, 0x45)
+#define COL_GAL_CARD_BD  RGB(0x29, 0x2E, 0x42)
+#define COL_GAL_THUMB_BG RGB(0x10, 0x11, 0x18)
+#define COL_GAL_THUMB_FG RGB(0x1F, 0x77, 0xFF)
+#define COL_GAL_PILL     RGB(0x24, 0x28, 0x3B)
+#define COL_GAL_PILL_AC  RGB(0x1F, 0x77, 0xFF)
+
+typedef struct {
+    HWND          hWnd;
+    SplitCategory activeCat;
+    int           hoverCardIdx;
+    int           cardPresets[PRESET_COUNT];   /* indices into kPresets for current cat */
+    int           cardCount;
+} GalleryCtx;
+
+static GalleryCtx* g_galCtx = NULL;
+
+static void gallery_rebuild_cards(void) {
+    g_galCtx->cardCount = 0;
+    for (int i = 0; i < PRESET_COUNT; ++i) {
+        if (i == PRESET_SINGLE) continue;
+        if (kPresets[i].category != g_galCtx->activeCat) continue;
+        g_galCtx->cardPresets[g_galCtx->cardCount++] = i;
+    }
+}
+
+static RECT gallery_pill_rect(int idx) {
+    /* 4 pills, ~110 px each, gap 8, anchored to the left after the back btn. */
+    RECT r;
+    int w = 124;
+    int gap = 10;
+    r.left = 24 + idx * (w + gap);
+    r.top = GAL_HDR_H + 8;
+    r.right = r.left + w;
+    r.bottom = r.top + GAL_PILLS_H - 16;
+    return r;
+}
+
+static RECT gallery_card_rect(int idx) {
+    /* 3 columns, rows wrap. */
+    int col = idx % 3;
+    int row = idx / 3;
+    RECT r;
+    r.left = GAL_GRID_PAD + col * (GAL_CARD_W + GAL_CARD_GAP);
+    r.top  = GAL_HDR_H + GAL_PILLS_H + row * (GAL_CARD_H + GAL_CARD_GAP) + 8;
+    r.right  = r.left + GAL_CARD_W;
+    r.bottom = r.top  + GAL_CARD_H;
+    return r;
+}
+
+static void gallery_paint_thumbnail(HDC dc, RECT canvas, const SplitPreset* preset) {
+    /* Dark canvas */
+    HBRUSH bg = CreateSolidBrush(COL_GAL_THUMB_BG);
+    FillRect(dc, &canvas, bg);
+    DeleteObject(bg);
+
+    /* Render each cell as a rounded blue rect, inset 4 px on all sides
+     * so the cells look distinct.                                    */
+    int W = canvas.right - canvas.left;
+    int H = canvas.bottom - canvas.top;
+    HBRUSH cellBr = CreateSolidBrush(COL_GAL_THUMB_FG);
+    HPEN   noPen  = (HPEN)GetStockObject(NULL_PEN);
+    HBRUSH oBr = (HBRUSH)SelectObject(dc, cellBr);
+    HPEN   oPen = (HPEN)SelectObject(dc, noPen);
+
+    for (int i = 0; i < preset->cellCount; ++i) {
+        const SplitCell* c = &preset->cells[i];
+        int x = canvas.left + (W * c->x) / 100 + 2;
+        int y = canvas.top  + (H * c->y) / 100 + 2;
+        int r = (c->x + c->w >= 100) ? canvas.right  : canvas.left + (W * (c->x + c->w)) / 100;
+        int b = (c->y + c->h >= 100) ? canvas.bottom : canvas.top  + (H * (c->y + c->h)) / 100;
+        r -= 2; b -= 2;
+        if (r <= x || b <= y) continue;
+        RoundRect(dc, x, y, r, b, 6, 6);
+    }
+    SelectObject(dc, oBr); SelectObject(dc, oPen);
+    DeleteObject(cellBr);
+}
+
+static int gallery_hit_test_card(int x, int y) {
+    for (int i = 0; i < g_galCtx->cardCount; ++i) {
+        RECT r = gallery_card_rect(i);
+        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return i;
+    }
+    return -1;
+}
+
+static int gallery_hit_test_pill(int x, int y) {
+    for (int i = 0; i < SCAT_COUNT; ++i) {
+        RECT r = gallery_pill_rect(i);
+        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return i;
+    }
+    return -1;
+}
+
+static LRESULT CALLBACK GalleryWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE:
+            return 0;
+        case WM_ERASEBKGND: return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(hWnd, &ps);
+            RECT cli; GetClientRect(hWnd, &cli);
+
+            /* Double-buffer */
+            HDC mem = CreateCompatibleDC(dc);
+            HBITMAP bmp = CreateCompatibleBitmap(dc, cli.right, cli.bottom);
+            HBITMAP oldBmp = (HBITMAP)SelectObject(mem, bmp);
+
+            /* Background */
+            fill_rect_color(mem, &cli, COL_GAL_BG);
+
+            /* Header — title + close hint */
+            draw_text_w(mem, 28, 22, L"Galeria de layouts", COL_FG, g_app.hFontBig);
+            draw_text_w(mem, 28, 52, L"Click num modelo pra aplicá-lo  ·  Esc para fechar",
+                        COL_FG_DIM, g_app.hFontUI);
+
+            /* Pills row */
+            for (int i = 0; i < SCAT_COUNT; ++i) {
+                RECT p = gallery_pill_rect(i);
+                BOOL active = (g_galCtx->activeCat == (SplitCategory)i);
+                draw_rounded_rect(mem, p,
+                                  active ? COL_GAL_PILL_AC : COL_GAL_PILL,
+                                  0, 18);
+                SIZE sz;
+                HFONT old = (HFONT)SelectObject(mem, g_app.hFontUI);
+                SetBkMode(mem, TRANSPARENT);
+                SetTextColor(mem, active ? RGB(255,255,255) : COL_FG);
+                const wchar_t* lbl = kSplitCategoryNames[i];
+                GetTextExtentPoint32W(mem, lbl, (int)wcslen(lbl), &sz);
+                TextOutW(mem,
+                         p.left + ((p.right - p.left) - sz.cx) / 2,
+                         p.top  + ((p.bottom - p.top) - sz.cy) / 2,
+                         lbl, (int)wcslen(lbl));
+                SelectObject(mem, old);
+            }
+
+            /* Card grid */
+            for (int i = 0; i < g_galCtx->cardCount; ++i) {
+                int presetIdx = g_galCtx->cardPresets[i];
+                const SplitPreset* preset = &kPresets[presetIdx];
+                BOOL hover = (g_galCtx->hoverCardIdx == i);
+                BOOL selected = (g_app.splitLayout == presetIdx);
+
+                RECT card = gallery_card_rect(i);
+                draw_rounded_rect(mem, card,
+                                  hover ? COL_GAL_CARD_H : COL_GAL_CARD,
+                                  selected ? COL_GAL_PILL_AC : COL_GAL_CARD_BD,
+                                  12);
+
+                /* Thumbnail centered */
+                RECT thumb;
+                thumb.left = card.left + ((card.right - card.left) - GAL_THUMB_W) / 2;
+                thumb.top  = card.top  + 18;
+                thumb.right  = thumb.left + GAL_THUMB_W;
+                thumb.bottom = thumb.top  + GAL_THUMB_H;
+                gallery_paint_thumbnail(mem, thumb, preset);
+
+                /* Name */
+                draw_text_w(mem, card.left + 16, card.top + 130,
+                            preset->name, COL_FG, g_app.hFontUI);
+
+                /* Subtitle: "N painéis" */
+                wchar_t sub[32];
+                _snwprintf_s(sub, 32, _TRUNCATE, L"%d %s",
+                             preset->cellCount,
+                             preset->cellCount == 1 ? L"painel" : L"painéis");
+                draw_text_w(mem, card.left + 16, card.top + 152,
+                            sub, COL_FG_DIM, g_app.hFontUI);
+            }
+
+            BitBlt(dc, 0, 0, cli.right, cli.bottom, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, oldBmp);
+            DeleteObject(bmp);
+            DeleteDC(mem);
+            EndPaint(hWnd, &ps);
+            return 0;
+        }
+
+        case WM_MOUSEMOVE: {
+            int x = LOWORD(lParam), y = HIWORD(lParam);
+            int hover = gallery_hit_test_card(x, y);
+            if (hover != g_galCtx->hoverCardIdx) {
+                g_galCtx->hoverCardIdx = hover;
+                InvalidateRect(hWnd, NULL, FALSE);
+            }
+            return 0;
+        }
+        case WM_LBUTTONDOWN: {
+            int x = LOWORD(lParam), y = HIWORD(lParam);
+            int pill = gallery_hit_test_pill(x, y);
+            if (pill >= 0) {
+                g_galCtx->activeCat = (SplitCategory)pill;
+                gallery_rebuild_cards();
+                g_galCtx->hoverCardIdx = -1;
+                InvalidateRect(hWnd, NULL, FALSE);
+                return 0;
+            }
+            int card = gallery_hit_test_card(x, y);
+            if (card >= 0) {
+                set_split_layout(g_galCtx->cardPresets[card]);
+                DestroyWindow(hWnd);
+                return 0;
+            }
+            return 0;
+        }
+        case WM_KEYDOWN:
+            if (wParam == VK_ESCAPE) { DestroyWindow(hWnd); return 0; }
+            /* Arrow keys cycle through cards visually */
+            if (wParam == VK_LEFT)  {
+                int n = g_galCtx->cardCount; if (n > 0) {
+                    g_galCtx->hoverCardIdx = (g_galCtx->hoverCardIdx <= 0)
+                        ? n - 1 : g_galCtx->hoverCardIdx - 1;
+                    InvalidateRect(hWnd, NULL, FALSE);
+                }
+                return 0;
+            }
+            if (wParam == VK_RIGHT) {
+                int n = g_galCtx->cardCount; if (n > 0) {
+                    g_galCtx->hoverCardIdx = (g_galCtx->hoverCardIdx + 1) % n;
+                    InvalidateRect(hWnd, NULL, FALSE);
+                }
+                return 0;
+            }
+            if (wParam == VK_RETURN && g_galCtx->hoverCardIdx >= 0) {
+                set_split_layout(g_galCtx->cardPresets[g_galCtx->hoverCardIdx]);
+                DestroyWindow(hWnd);
+                return 0;
+            }
+            return 0;
+        case WM_CLOSE:    DestroyWindow(hWnd); return 0;
+        case WM_DESTROY:
+            PostThreadMessageW(GetCurrentThreadId(), WM_NULL, 0, 0);
+            return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+static void show_layout_gallery(void) {
+    static BOOL registered = FALSE;
+    if (!registered) {
+        WNDCLASSEXW wc = { sizeof(wc) };
+        wc.lpfnWndProc = GalleryWndProc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.hCursor = LoadCursorW(NULL, IDC_HAND);
+        wc.hbrBackground = NULL;
+        wc.lpszClassName = L"DanteLayoutGallery";
+        RegisterClassExW(&wc);
+        registered = TRUE;
+    }
+
+    GalleryCtx ctx = {0};
+    ctx.activeCat = SCAT_SIMPLE;
+    ctx.hoverCardIdx = -1;
+    /* If current layout has a category, open on that tab. */
+    if (g_app.splitLayout > 0 && g_app.splitLayout < PRESET_COUNT)
+        ctx.activeCat = kPresets[g_app.splitLayout].category;
+    g_galCtx = &ctx;
+    gallery_rebuild_cards();
+
+    RECT pr; GetWindowRect(g_app.hWnd, &pr);
+    int x = pr.left + ((pr.right - pr.left) - GAL_W) / 2;
+    int y = pr.top  + ((pr.bottom - pr.top) - GAL_H) / 2;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        L"DanteLayoutGallery", L"Galeria de layouts — Dante CLI",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        x, y, GAL_W, GAL_H, g_app.hWnd, NULL, GetModuleHandleW(NULL), NULL);
+    ctx.hWnd = dlg;
+
+    ShowWindow(dlg, SW_SHOW);
+    SetFocus(dlg);
+    EnableWindow(g_app.hWnd, FALSE);
+
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+        if (!IsWindow(dlg)) break;
+    }
+    EnableWindow(g_app.hWnd, TRUE);
+    SetForegroundWindow(g_app.hWnd);
+    g_galCtx = NULL;
+}
 
 /* Build a categorised popup: each category is a submenu, presets inside it
  * are sorted by their position in kPresets[]. */
@@ -3654,8 +3964,13 @@ static void perform_toolbar_action(int idx) {
             show_settings_dialog();
             break;
         case 5: {
-            POINT pt; GetCursorPos(&pt); ScreenToClient(g_app.hWnd, &pt);
-            show_split_menu(g_app.hWnd, pt.x, pt.y);
+            /* Shift = quick popup menu; default = visual gallery. */
+            if (GetKeyState(VK_SHIFT) & 0x8000) {
+                POINT pt; GetCursorPos(&pt); ScreenToClient(g_app.hWnd, &pt);
+                show_split_menu(g_app.hWnd, pt.x, pt.y);
+            } else {
+                show_layout_gallery();
+            }
             break;
         }
     }
