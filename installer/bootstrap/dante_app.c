@@ -74,7 +74,7 @@ static PFN_ClosePseudoConsole  pClosePseudoConsole  = NULL;
  *                              CONSTANTS
  * ========================================================================= */
 
-#define APP_VERSION_W   L"1.0.28"
+#define APP_VERSION_W   L"1.0.29"
 #define APP_NAME_W      L"Dante CLI"
 #define APP_WINDOW_CLS  L"DanteCLIMainWindow"
 
@@ -633,6 +633,8 @@ static void unslot_cell(int cellIdx);
 static void files_refresh(void);
 static void files_set_dir(const wchar_t* path);
 static void files_navigate_up(void);
+static BOOL is_text_file(const wchar_t* path);
+static void show_editor_preview(const wchar_t* path);
 static const SplitCell* resolve_cell(int idx);
 static void show_resize_popup(int cellIdx, int screenX, int screenY);
 static RECT split_cell_rect(const RECT* parent, const SplitCell* c);
@@ -2934,6 +2936,286 @@ static void show_resource_monitor(int anchorX, int anchorY) {
     SetForegroundWindow(g_monitorHwnd);
 }
 
+/* =====================================================================
+ *                       EDITOR PREVIEW (text drop)
+ *
+ * When the user drops a text-like file on the window, instead of just
+ * injecting the path into the active terminal we open a non-modal popup
+ * with the contents in a multiline EDIT control (Cascadia Code, dark).
+ * Capped at 512 KB and 32-bit safe. Read-only by default; toggle to
+ * read-write via the "Editar" button — Ctrl+S salva no mesmo arquivo.
+ * ===================================================================== */
+
+static BOOL is_text_file(const wchar_t* path) {
+    const wchar_t* dot = wcsrchr(path, L'.');
+    if (!dot) return FALSE;
+    static const wchar_t* exts[] = {
+        L".txt", L".md", L".markdown", L".json", L".jsonc", L".yaml", L".yml",
+        L".toml", L".ini", L".cfg", L".conf", L".log", L".csv", L".tsv",
+        L".c", L".h", L".cpp", L".hpp", L".cc", L".hh", L".cs", L".java",
+        L".py", L".rb", L".js", L".jsx", L".ts", L".tsx", L".go", L".rs",
+        L".php", L".kt", L".swift", L".m", L".mm", L".sh", L".bash", L".zsh",
+        L".ps1", L".psm1", L".bat", L".cmd",
+        L".html", L".htm", L".css", L".scss", L".sass", L".xml", L".svg",
+        L".sql", L".graphql", L".proto", L".env", L".gitignore",
+        L".lua", L".pl", L".tcl", L".vim", L".el"
+    };
+    for (size_t i = 0; i < sizeof(exts) / sizeof(exts[0]); ++i) {
+        if (_wcsicmp(dot, exts[i]) == 0) return TRUE;
+    }
+    return FALSE;
+}
+
+typedef struct {
+    HWND     hWnd;
+    HWND     hEdit;
+    HWND     hPathLabel;
+    HWND     hSaveBtn;
+    HWND     hCloseBtn;
+    HWND     hToggleBtn;
+    wchar_t  path[MAX_PATH];
+    BOOL     readonly;
+    BOOL     dirty;
+} EditorCtx;
+
+static EditorCtx* g_editorCtx = NULL;
+
+static BOOL load_file_utf8_to_wstring(const wchar_t* path, wchar_t** outBuf, size_t* outChars) {
+    *outBuf = NULL; *outChars = 0;
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return FALSE;
+    LARGE_INTEGER sz; GetFileSizeEx(f, &sz);
+    if (sz.QuadPart > 512 * 1024) { CloseHandle(f); return FALSE; }
+    DWORD n = (DWORD)sz.QuadPart;
+    char* raw = (char*)malloc(n + 1);
+    DWORD got = 0;
+    if (!ReadFile(f, raw, n, &got, NULL)) { free(raw); CloseHandle(f); return FALSE; }
+    raw[got] = 0;
+    CloseHandle(f);
+
+    /* Strip UTF-8 BOM if present. */
+    char* start = raw;
+    if (got >= 3 && (unsigned char)raw[0] == 0xEF &&
+        (unsigned char)raw[1] == 0xBB && (unsigned char)raw[2] == 0xBF) {
+        start += 3; got -= 3;
+    }
+
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, start, (int)got, NULL, 0);
+    if (wlen < 0) { free(raw); return FALSE; }
+    wchar_t* buf = (wchar_t*)malloc((wlen + 1) * sizeof(wchar_t));
+    MultiByteToWideChar(CP_UTF8, 0, start, (int)got, buf, wlen);
+    buf[wlen] = 0;
+    free(raw);
+
+    /* EDIT control needs \r\n. Normalize any lone \n. */
+    size_t crlfLen = 0;
+    for (int i = 0; i < wlen; ++i) {
+        if (buf[i] == L'\n' && (i == 0 || buf[i-1] != L'\r')) crlfLen++;
+        crlfLen++;
+    }
+    wchar_t* norm = (wchar_t*)malloc((crlfLen + 1) * sizeof(wchar_t));
+    size_t o = 0;
+    for (int i = 0; i < wlen; ++i) {
+        if (buf[i] == L'\n' && (i == 0 || buf[i-1] != L'\r')) norm[o++] = L'\r';
+        norm[o++] = buf[i];
+    }
+    norm[o] = 0;
+    free(buf);
+
+    *outBuf = norm;
+    *outChars = o;
+    return TRUE;
+}
+
+static BOOL save_wstring_to_utf8(const wchar_t* path, const wchar_t* text) {
+    int nutf = WideCharToMultiByte(CP_UTF8, 0, text, -1, NULL, 0, NULL, NULL);
+    if (nutf <= 0) return FALSE;
+    char* utf = (char*)malloc(nutf);
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, utf, nutf, NULL, NULL);
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, NULL,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) { free(utf); return FALSE; }
+    DWORD wrote = 0;
+    BOOL ok = WriteFile(f, utf, nutf - 1, &wrote, NULL);
+    CloseHandle(f);
+    free(utf);
+    return ok;
+}
+
+static WNDPROC g_origEditorEditProc = NULL;
+
+static LRESULT CALLBACK EditorEditSubclass(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_KEYDOWN && w == 'S' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+        if (g_editorCtx && !g_editorCtx->readonly) {
+            SendMessageW(GetParent(h), WM_COMMAND, MAKEWPARAM(601, 0), 0); /* Save */
+        }
+        return 0;
+    }
+    if (m == WM_KEYDOWN && w == VK_ESCAPE) {
+        SendMessageW(GetParent(h), WM_CLOSE, 0, 0);
+        return 0;
+    }
+    return CallWindowProcW(g_origEditorEditProc, h, m, w, l);
+}
+
+static void editor_relayout(HWND hWnd) {
+    RECT cli; GetClientRect(hWnd, &cli);
+    int topPad = 38, bottomPad = 56;
+    if (g_editorCtx->hPathLabel)
+        SetWindowPos(g_editorCtx->hPathLabel, NULL, 14, 10,
+                     cli.right - 28, 24, SWP_NOZORDER);
+    if (g_editorCtx->hEdit)
+        SetWindowPos(g_editorCtx->hEdit, NULL,
+                     14, topPad,
+                     cli.right - 28, cli.bottom - topPad - bottomPad,
+                     SWP_NOZORDER);
+    if (g_editorCtx->hToggleBtn)
+        SetWindowPos(g_editorCtx->hToggleBtn, NULL,
+                     14, cli.bottom - 44, 110, 32, SWP_NOZORDER);
+    if (g_editorCtx->hSaveBtn)
+        SetWindowPos(g_editorCtx->hSaveBtn, NULL,
+                     130, cli.bottom - 44, 90, 32, SWP_NOZORDER);
+    if (g_editorCtx->hCloseBtn)
+        SetWindowPos(g_editorCtx->hCloseBtn, NULL,
+                     cli.right - 14 - 90, cli.bottom - 44, 90, 32, SWP_NOZORDER);
+}
+
+static LRESULT CALLBACK EditorWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE: {
+            HFONT f = g_app.hFontUI;
+
+            g_editorCtx->hPathLabel = CreateWindowExW(0, L"STATIC", g_editorCtx->path,
+                WS_CHILD | WS_VISIBLE | SS_PATHELLIPSIS,
+                0, 0, 0, 0, hWnd, NULL, GetModuleHandleW(NULL), NULL);
+            SendMessageW(g_editorCtx->hPathLabel, WM_SETFONT, (WPARAM)f, TRUE);
+
+            g_editorCtx->hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_WANTRETURN |
+                WS_VSCROLL | WS_HSCROLL | ES_AUTOVSCROLL | ES_AUTOHSCROLL |
+                ES_READONLY,
+                0, 0, 0, 0, hWnd, NULL, GetModuleHandleW(NULL), NULL);
+            SendMessageW(g_editorCtx->hEdit, WM_SETFONT, (WPARAM)g_app.hFontMono, TRUE);
+            SendMessageW(g_editorCtx->hEdit, EM_SETLIMITTEXT, (WPARAM)(512 * 1024), 0);
+
+            g_editorCtx->hToggleBtn = CreateWindowExW(0, L"BUTTON", L"✎  Editar",
+                WS_CHILD | WS_VISIBLE,
+                0, 0, 0, 0, hWnd, (HMENU)600, GetModuleHandleW(NULL), NULL);
+            SendMessageW(g_editorCtx->hToggleBtn, WM_SETFONT, (WPARAM)f, TRUE);
+
+            g_editorCtx->hSaveBtn = CreateWindowExW(0, L"BUTTON", L"💾 Salvar",
+                WS_CHILD | WS_DISABLED,
+                0, 0, 0, 0, hWnd, (HMENU)601, GetModuleHandleW(NULL), NULL);
+            SendMessageW(g_editorCtx->hSaveBtn, WM_SETFONT, (WPARAM)f, TRUE);
+
+            g_editorCtx->hCloseBtn = CreateWindowExW(0, L"BUTTON", L"Fechar",
+                WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+                0, 0, 0, 0, hWnd, (HMENU)IDCANCEL, GetModuleHandleW(NULL), NULL);
+            SendMessageW(g_editorCtx->hCloseBtn, WM_SETFONT, (WPARAM)f, TRUE);
+
+            g_origEditorEditProc = (WNDPROC)SetWindowLongPtrW(
+                g_editorCtx->hEdit, GWLP_WNDPROC, (LONG_PTR)EditorEditSubclass);
+
+            /* Load file content */
+            wchar_t* text = NULL; size_t n = 0;
+            if (load_file_utf8_to_wstring(g_editorCtx->path, &text, &n) && text) {
+                SetWindowTextW(g_editorCtx->hEdit, text);
+                free(text);
+            } else {
+                SetWindowTextW(g_editorCtx->hEdit,
+                    L"(Não foi possível abrir o arquivo — talvez seja maior que 512 KB ou tenha codificação não-UTF8.)");
+            }
+            g_editorCtx->dirty = FALSE;
+            editor_relayout(hWnd);
+            SetFocus(g_editorCtx->hEdit);
+            return 0;
+        }
+        case WM_SIZE: editor_relayout(hWnd); return 0;
+        case WM_COMMAND:
+            if (HIWORD(wParam) == EN_CHANGE && (HWND)lParam == g_editorCtx->hEdit) {
+                g_editorCtx->dirty = TRUE;
+                return 0;
+            }
+            if (LOWORD(wParam) == 600) {
+                /* Toggle read/write */
+                g_editorCtx->readonly = !g_editorCtx->readonly;
+                SendMessageW(g_editorCtx->hEdit, EM_SETREADONLY,
+                             g_editorCtx->readonly, 0);
+                SetWindowTextW(g_editorCtx->hToggleBtn,
+                    g_editorCtx->readonly ? L"✎  Editar" : L"🔒 Somente leitura");
+                EnableWindow(g_editorCtx->hSaveBtn, !g_editorCtx->readonly);
+            } else if (LOWORD(wParam) == 601) {
+                /* Save */
+                int len = GetWindowTextLengthW(g_editorCtx->hEdit);
+                wchar_t* buf = (wchar_t*)malloc((len + 2) * sizeof(wchar_t));
+                GetWindowTextW(g_editorCtx->hEdit, buf, len + 1);
+                BOOL ok = save_wstring_to_utf8(g_editorCtx->path, buf);
+                free(buf);
+                MessageBoxW(hWnd,
+                    ok ? L"Arquivo salvo." : L"Falha ao salvar (arquivo pode estar protegido).",
+                    L"Editor", ok ? MB_ICONINFORMATION : MB_ICONERROR);
+                if (ok) g_editorCtx->dirty = FALSE;
+            } else if (LOWORD(wParam) == IDCANCEL) {
+                DestroyWindow(hWnd);
+            }
+            return 0;
+        case WM_CLOSE:
+            if (g_editorCtx->dirty) {
+                int r = MessageBoxW(hWnd,
+                    L"Você tem alterações não salvas.\nFechar mesmo assim?",
+                    L"Editor", MB_ICONQUESTION | MB_YESNO);
+                if (r != IDYES) return 0;
+            }
+            DestroyWindow(hWnd);
+            return 0;
+        case WM_DESTROY:
+            free(g_editorCtx);
+            g_editorCtx = NULL;
+            return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+static void show_editor_preview(const wchar_t* path) {
+    static BOOL registered = FALSE;
+    if (!registered) {
+        WNDCLASSEXW wc = { sizeof(wc) };
+        wc.lpfnWndProc = EditorWndProc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"DanteEditor";
+        wc.hIcon = LoadIconW(GetModuleHandleW(NULL), L"DanteIcon");
+        wc.hIconSm = wc.hIcon;
+        RegisterClassExW(&wc);
+        registered = TRUE;
+    }
+    if (g_editorCtx && g_editorCtx->hWnd && IsWindow(g_editorCtx->hWnd)) {
+        DestroyWindow(g_editorCtx->hWnd);
+    }
+    g_editorCtx = (EditorCtx*)xcalloc(1, sizeof(EditorCtx));
+    str_copy_w(g_editorCtx->path, MAX_PATH, path);
+    g_editorCtx->readonly = TRUE;
+
+    RECT pr; GetWindowRect(g_app.hWnd, &pr);
+    int W = 900, H = 640;
+    int x = pr.left + ((pr.right - pr.left) - W) / 2;
+    int y = pr.top  + ((pr.bottom - pr.top) - H) / 2;
+
+    /* Use only the filename in the title for brevity. */
+    const wchar_t* base = wcsrchr(path, L'\\');
+    wchar_t title[MAX_PATH + 16];
+    _snwprintf_s(title, MAX_PATH + 16, _TRUNCATE,
+                 L"%s — Dante CLI Editor", base ? base + 1 : path);
+
+    g_editorCtx->hWnd = CreateWindowExW(0, L"DanteEditor", title,
+        WS_OVERLAPPEDWINDOW,
+        x, y, W, H, g_app.hWnd, NULL, GetModuleHandleW(NULL), NULL);
+    ShowWindow(g_editorCtx->hWnd, SW_SHOW);
+    SetForegroundWindow(g_editorCtx->hWnd);
+}
+
 /* =========================================================================
  *                       SPLIT WORKSPACE
  * ========================================================================= */
@@ -4900,11 +5182,33 @@ static void draw_terminal_cell(HDC dc, const RECT* rc, int tabIdx, BOOL hasFocus
     const int TERM_PAD_X = 20;
     const int TERM_PAD_Y = 14;
 
+    /* Per-tab font override: when t->customFontSize > 0 we build a temporary
+     * font and use it instead of g_app.hFontMono. cellW/cellH are also
+     * remeasured locally so the grid sizing matches.                     */
+    HFONT localMono = NULL, localMonoBold = NULL;
+    int localW = g_app.cellW, localH = g_app.cellH;
+    if (t->customFontSize > 0) {
+        localMono = CreateFontW(-t->customFontSize, 0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Cascadia Code");
+        localMonoBold = CreateFontW(-t->customFontSize, 0,0,0,FW_BOLD,FALSE,FALSE,FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Cascadia Code");
+        HFONT oldM = (HFONT)SelectObject(dc, localMono);
+        TEXTMETRICW tm;
+        GetTextMetricsW(dc, &tm);
+        SIZE s; GetTextExtentPoint32W(dc, L"M", 1, &s);
+        localW = max_int(s.cx, tm.tmAveCharWidth);
+        localH = tm.tmHeight;
+        SelectObject(dc, oldM);
+    }
+
     int areaW = (rc->right - rc->left) - 2 * TERM_PAD_X;
     int areaH = (rc->bottom - rc->top) - 2 * TERM_PAD_Y;
     if (g_app.cellW == 0 || g_app.cellH == 0) measure_cell(dc);
-    int cols = max_int(20, areaW / max_int(1, g_app.cellW));
-    int rows = max_int(5,  areaH / max_int(1, g_app.cellH));
+    if (t->customFontSize == 0) { localW = g_app.cellW; localH = g_app.cellH; }
+    int cols = max_int(20, areaW / max_int(1, localW));
+    int rows = max_int(5,  areaH / max_int(1, localH));
     cols = min_int(cols, MAX_COLS);
     rows = min_int(rows, MAX_ROWS);
     if (cols != t->grid.cols || rows != t->grid.rows) {
@@ -4912,28 +5216,30 @@ static void draw_terminal_cell(HDC dc, const RECT* rc, int tabIdx, BOOL hasFocus
         if (t->session) session_resize(t->session, cols, rows);
     }
 
-    HFONT old = (HFONT)SelectObject(dc, g_app.hFontMono);
+    HFONT baseMono = localMono ? localMono : g_app.hFontMono;
+    HFONT baseMonoBold = localMonoBold ? localMonoBold : g_app.hFontMonoBold;
+    HFONT old = (HFONT)SelectObject(dc, baseMono);
     SetBkMode(dc, OPAQUE);
 
     int baseX = rc->left + TERM_PAD_X;
     int baseY = rc->top  + TERM_PAD_Y;
 
     for (int r = 0; r < rows; ++r) {
-        int y = baseY + r * g_app.cellH;
+        int y = baseY + r * localH;
         for (int c = 0; c < cols; ++c) {
             const Cell* cell = &t->grid.cells[r * cols + c];
             COLORREF fg = resolve_fg(cell);
             COLORREF bg = resolve_bg(cell);
             if (cell->attr & ATTR_REVERSE) { COLORREF tmp = fg; fg = bg; bg = tmp; }
-            int x = baseX + c * g_app.cellW;
+            int x = baseX + c * localW;
 
             /* bg fill if needed */
             if (bg != sc->bg) {
-                RECT bgR = { x, y, x + g_app.cellW, y + g_app.cellH };
+                RECT bgR = { x, y, x + localW, y + localH };
                 fill_rect_color(dc, &bgR, bg);
             }
             if (cell->ch != L' ' && cell->ch != 0) {
-                HFONT useFont = (cell->attr & ATTR_BOLD) ? g_app.hFontMonoBold : g_app.hFontMono;
+                HFONT useFont = (cell->attr & ATTR_BOLD) ? baseMonoBold : baseMono;
                 HFONT prev = (HFONT)SelectObject(dc, useFont);
                 SetTextColor(dc, fg);
                 SetBkColor(dc, bg);
@@ -4944,14 +5250,16 @@ static void draw_terminal_cell(HDC dc, const RECT* rc, int tabIdx, BOOL hasFocus
     }
 
     /* Cursor */
-    int cx = baseX + t->grid.cursorCol * g_app.cellW;
-    int cy = baseY + t->grid.cursorRow * g_app.cellH;
-    RECT cur = { cx, cy, cx + g_app.cellW, cy + g_app.cellH };
+    int cx = baseX + t->grid.cursorCol * localW;
+    int cy = baseY + t->grid.cursorRow * localH;
+    RECT cur = { cx, cy, cx + localW, cy + localH };
     HBRUSH cb = CreateSolidBrush(sc->cursor);
     FrameRect(dc, &cur, cb);
     DeleteObject(cb);
 
     SelectObject(dc, old);
+    if (localMono)     DeleteObject(localMono);
+    if (localMonoBold) DeleteObject(localMonoBold);
 
     t->grid.dirty = 0;
 }
@@ -5938,10 +6246,30 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 int x = LOWORD(lParam), y = HIWORD(lParam);
                 RECT sideRc, tabRc, termRc, toolbarRc, statusRc;
                 layout_compute(&sideRc, &tabRc, &termRc, &toolbarRc, &statusRc);
+
+                /* Dropped over the terminal area in split mode → assign that
+                 * tab to whichever slot the cursor is hovering.            */
+                if (g_app.splitLayout != PRESET_SINGLE &&
+                    x >= termRc.left && x < termRc.right &&
+                    y >= termRc.top && y < termRc.bottom) {
+                    const SplitPreset* preset = &kPresets[g_app.splitLayout];
+                    for (int i = 0; i < preset->cellCount; ++i) {
+                        const SplitCell* sc = resolve_cell(i);
+                        if (!sc) continue;
+                        RECT cellRc = split_cell_rect(&termRc, sc);
+                        if (x >= cellRc.left && x < cellRc.right &&
+                            y >= cellRc.top && y < cellRc.bottom) {
+                            g_app.splitSlots[i] = g_app.dragTabIdx;
+                            g_app.splitActiveCell = i;
+                            schedule_persist();
+                            break;
+                        }
+                    }
+                }
+                /* Standard tab-bar reorder. */
                 int target = hit_test_tab(x, y, &tabRc);
                 if (target >= 0 && target != g_app.dragTabIdx) {
                     Tab* moving = g_app.tabs[g_app.dragTabIdx];
-                    /* shift */
                     if (target > g_app.dragTabIdx) {
                         for (int i = g_app.dragTabIdx; i < target; ++i) g_app.tabs[i] = g_app.tabs[i + 1];
                     } else {
@@ -6178,18 +6506,19 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 DragQueryFileW(hDrop, i, path, MAX_PATH);
                 DWORD attr = GetFileAttributesW(path);
                 if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
-                    /* Folder → new tab opened with `cd "<path>"`. */
                     open_new_tab(L"powershell");
                     Tab* nt = g_app.tabs[g_app.tabCount - 1];
                     str_copy_w(nt->title, 128, wcsrchr(path, L'\\') ? wcsrchr(path, L'\\') + 1 : path);
                     str_copy_w(nt->emoji, 8, L"\U0001F4C1");
                     wchar_t cmd[MAX_PATH + 16];
                     _snwprintf_s(cmd, MAX_PATH + 16, _TRUNCATE, L"cd \"%s\"\r", path);
-                    /* Wait a beat for the shell to settle. */
                     Sleep(150);
                     inject_into_active(cmd);
+                } else if (is_text_file(path)) {
+                    /* Text-like file → open in the editor preview. */
+                    show_editor_preview(path);
                 } else {
-                    /* File → inject quoted path into active terminal. */
+                    /* Other file → inject quoted path into active terminal. */
                     wchar_t buf[MAX_PATH + 8];
                     _snwprintf_s(buf, MAX_PATH + 8, _TRUNCATE, L"\"%s\" ", path);
                     inject_into_active(buf);

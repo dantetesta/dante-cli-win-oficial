@@ -3,6 +3,20 @@
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 Versionamento [SemVer](https://semver.org/lang/pt-BR/).
 
+## [1.0.29] — 2026-05-20
+
+### Adicionado
+- **Tamanho de fonte per-tab visualmente aplicado** — antes só persistia. Agora a célula daquela aba é renderizada com fonte de tamanho próprio (Cascadia Code no size escolhido), `cellW/cellH` recalculados localmente, grid e ConPTY redimensionados. Fonte temporária é liberada ao fim do paint.
+- **Drag tab → slot** — em modo split, arrastar o chip da aba e soltar dentro de uma célula **atribui aquela aba ao slot**. O slot anterior fica vazio se houver. Equivale ao comportamento do macOS Swift.
+- **Editor preview ao soltar arquivos texto**:
+  - Detecta ~50 extensões text-like (.c .py .ts .json .md .yaml .log .ini .ps1 .sh .html .css …).
+  - Abre **janela própria** 900×640 com EDIT multiline, fonte Cascadia Code, scroll vertical e horizontal.
+  - Cap de **512 KB** + decode UTF-8 (com strip de BOM); normaliza `\n` → `\r\n` pro EDIT control.
+  - **Read-only por padrão**; botão "✎ Editar" alterna pra edição, **Ctrl+S salva** no mesmo arquivo (UTF-8).
+  - Aviso antes de fechar com mudanças não salvas.
+  - Esc fecha; "Fechar" também.
+- Arquivos não-text continuam injetando o caminho no terminal ativo (comportamento da 1.0.28 preservado pra binários/imagens).
+
 ## [1.0.28] — 2026-05-20
 
 ### Adicionado
