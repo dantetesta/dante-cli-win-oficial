@@ -3,6 +3,24 @@
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 Versionamento [SemVer](https://semver.org/lang/pt-BR/).
 
+## [1.0.28] — 2026-05-20
+
+### Adicionado
+- **Aparência por aba** — botão direito na aba → **Aparência** abre dois submenus:
+  - **Tema**: lista os 19 esquemas; checked indica o override atual.
+  - **Tamanho da fonte**: 9pt..28pt. Marca o size corrente.
+  - **"Voltar ao padrão global"** quando há override → zera.
+  - Persistido em `state.json` (`scheme`/`fontSize` por tab); o terminal pinta com o esquema da aba ativa.
+- **Drag&drop do Explorer**:
+  - **Pasta** arrastada para a janela → abre **nova aba** com `cd "<pasta>"`, título = nome da pasta, emoji 📁.
+  - **Arquivo** arrastado → injeta o caminho com aspas no terminal ativo.
+  - Multi-arquivo suportado.
+  - Implementado via `DragAcceptFiles` + `WM_DROPFILES` (interface clássica do Win32, sem precisar OLE).
+- **Ícones do header revisados** — glifos `⤢/⤡/⇲/🚪` que renderizavam quadrados/inconsistentes substituídos por `▢/▭/↔/↩` (caracteres Unicode garantidos no Segoe UI).
+
+### Backlog
+- Drag&drop interno (tab → slot) ainda usa o popup menu/galeria. OLE drop target completo pra arrastar tabs entre slots fica para uma próxima rodada.
+
 ## [1.0.27] — 2026-05-20
 
 ### Corrigido

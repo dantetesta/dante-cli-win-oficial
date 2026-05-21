@@ -74,7 +74,7 @@ static PFN_ClosePseudoConsole  pClosePseudoConsole  = NULL;
  *                              CONSTANTS
  * ========================================================================= */
 
-#define APP_VERSION_W   L"1.0.27"
+#define APP_VERSION_W   L"1.0.28"
 #define APP_NAME_W      L"Dante CLI"
 #define APP_WINDOW_CLS  L"DanteCLIMainWindow"
 
@@ -248,6 +248,15 @@ static int g_schemeIdx = 0;  /* index into kSchemes; default Tokyo Night */
 static const ColorScheme* current_scheme(void) {
     if (g_schemeIdx < 0 || g_schemeIdx >= SCHEME_COUNT) return &kSchemes[0];
     return &kSchemes[g_schemeIdx];
+}
+
+/* Resolve scheme by string id (case-insensitive). NULL if not found. */
+static const ColorScheme* scheme_by_id(const wchar_t* id) {
+    if (!id || !id[0]) return NULL;
+    for (int i = 0; i < SCHEME_COUNT; ++i) {
+        if (_wcsicmp(kSchemes[i].id, id) == 0) return &kSchemes[i];
+    }
+    return NULL;
 }
 
 #define kAnsiPalette (current_scheme()->ansi)
@@ -479,6 +488,9 @@ typedef struct {
      * ~540 syscalls/s in Grid 3×3.                                       */
     SIZE_T       cachedMemBytes;
     double       cachedCpuPct;
+    /* Per-tab appearance override. Empty/0 = inherit global Settings. */
+    wchar_t      customScheme[32];
+    int          customFontSize;
 } Tab;
 
 /* =========================================================================
@@ -1433,6 +1445,12 @@ static void persist_save(void) {
         fwprintf(f, L", \"color\": %d",   t->colorIdx);
         fwprintf(f, L", \"pinned\": %s",  t->pinned ? L"true" : L"false");
         fwprintf(f, L", \"shell\": \"powershell\"");
+        if (t->customScheme[0]) {
+            fwprintf(f, L", \"scheme\": "); json_write_string(f, t->customScheme);
+        }
+        if (t->customFontSize > 0) {
+            fwprintf(f, L", \"fontSize\": %d", t->customFontSize);
+        }
         fwprintf(f, L"}%ls\n", (i + 1 < g_app.tabCount) ? L"," : L"");
     }
     fwprintf(f, L"  ],\n");
@@ -1606,6 +1624,21 @@ static void on_tab_object(const wchar_t* s, const wchar_t* e) {
     str_copy_w(t->emoji, 8, emoji);
     t->colorIdx = clamp_int(colorIdx, 0, 11);
     t->pinned = isPinned;
+
+    /* Per-tab look override */
+    {
+        const wchar_t* sk = wcsstr(s, L"\"scheme\"");
+        if (sk && sk < e) {
+            const wchar_t* col = wcschr(sk, L':');
+            if (col && col < e) read_json_string(col + 1, t->customScheme, 32);
+        }
+        const wchar_t* fk = wcsstr(s, L"\"fontSize\"");
+        if (fk && fk < e) {
+            const wchar_t* col = wcschr(fk, L':');
+            if (col && col < e) { col++; while (*col == L' ') ++col; t->customFontSize = _wtoi(col); }
+        }
+    }
+
     terminal_grid_init(&t->grid, 120, 30);
     parser_init(&t->parser);
     t->session = session_create(L"powershell", 120, 30);
@@ -2109,7 +2142,11 @@ enum {
     IDM_TAB_NEW_CMD,
     IDM_TAB_EMOJI_PICK,
     IDM_TAB_EMOJI_NONE,
-    IDM_TAB_COLOR_BASE = 0x1200,    /* +0..11 */
+    IDM_TAB_APPEARANCE,
+    IDM_TAB_COLOR_BASE   = 0x1200,    /* +0..11 */
+    IDM_TAB_SCHEME_BASE  = 0x1300,    /* +0..SCHEME_COUNT-1 */
+    IDM_TAB_FONTSIZE_BASE = 0x1400,   /* +9..28 inclusive */
+    IDM_TAB_RESET_LOOK    = 0x14FF,   /* clear per-tab override */
 };
 
 /* Curated set of "developer-friendly" emoji shown in the picker. */
@@ -2307,6 +2344,40 @@ static void show_tab_context_menu(HWND hWnd, int tabIdx, int x, int y) {
     if (g_app.tabs[tabIdx]->emoji[0])
         AppendMenuW(m, MF_STRING, IDM_TAB_EMOJI_NONE, L"Remover emoji");
 
+    /* Aparência — submenu com Tema + Tamanho de fonte (override per-tab). */
+    {
+        HMENU app_menu = CreatePopupMenu();
+
+        HMENU schemes = CreatePopupMenu();
+        for (int i = 0; i < SCHEME_COUNT; ++i) {
+            UINT flags = MF_STRING;
+            if (g_app.tabs[tabIdx]->customScheme[0] &&
+                _wcsicmp(g_app.tabs[tabIdx]->customScheme, kSchemes[i].id) == 0)
+                flags |= MF_CHECKED;
+            AppendMenuW(schemes, flags,
+                        IDM_TAB_SCHEME_BASE + i, kSchemes[i].displayName);
+        }
+        AppendMenuW(app_menu, MF_POPUP, (UINT_PTR)schemes, L"Tema");
+
+        HMENU sizes = CreatePopupMenu();
+        for (int s = 9; s <= 28; ++s) {
+            wchar_t lbl[16];
+            _snwprintf_s(lbl, 16, _TRUNCATE, L"%d pt", s);
+            UINT flags = MF_STRING;
+            if (g_app.tabs[tabIdx]->customFontSize == s) flags |= MF_CHECKED;
+            AppendMenuW(sizes, flags, IDM_TAB_FONTSIZE_BASE + s, lbl);
+        }
+        AppendMenuW(app_menu, MF_POPUP, (UINT_PTR)sizes, L"Tamanho da fonte");
+
+        if (g_app.tabs[tabIdx]->customScheme[0] ||
+            g_app.tabs[tabIdx]->customFontSize > 0) {
+            AppendMenuW(app_menu, MF_SEPARATOR, 0, NULL);
+            AppendMenuW(app_menu, MF_STRING, IDM_TAB_RESET_LOOK,
+                        L"Voltar ao padrão global");
+        }
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)app_menu, L"Aparência");
+    }
+
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_TAB_NEW_PWSH7, L"Nova aba (PowerShell 7)");
     AppendMenuW(m, MF_STRING, IDM_TAB_NEW_CMD,   L"Nova aba (cmd.exe)");
@@ -2349,6 +2420,17 @@ static void show_tab_context_menu(HWND hWnd, int tabIdx, int x, int y) {
         show_emoji_picker(tabIdx);
     } else if (cmd == IDM_TAB_EMOJI_NONE) {
         g_app.tabs[tabIdx]->emoji[0] = 0;
+        schedule_persist();
+    } else if (cmd >= IDM_TAB_SCHEME_BASE && cmd < IDM_TAB_SCHEME_BASE + SCHEME_COUNT) {
+        int idx = cmd - IDM_TAB_SCHEME_BASE;
+        str_copy_w(g_app.tabs[tabIdx]->customScheme, 32, kSchemes[idx].id);
+        schedule_persist();
+    } else if (cmd >= IDM_TAB_FONTSIZE_BASE + 9 && cmd <= IDM_TAB_FONTSIZE_BASE + 28) {
+        g_app.tabs[tabIdx]->customFontSize = cmd - IDM_TAB_FONTSIZE_BASE;
+        schedule_persist();
+    } else if (cmd == IDM_TAB_RESET_LOOK) {
+        g_app.tabs[tabIdx]->customScheme[0] = 0;
+        g_app.tabs[tabIdx]->customFontSize = 0;
         schedule_persist();
     }
 
@@ -4676,7 +4758,8 @@ static void draw_terminal_header(HDC dc, RECT hdr, Tab* t, BOOL hasFocus, int ce
         BOOL isZoomed = (g_app.zoomedCell == cellIdx);
         COLORREF btnBg = mix_color(acc, RGB(0,0,0), isZoomed ? 0.55 : 0.35);
         draw_rounded_rect(dc, btn, btnBg, 0, 8);
-        const wchar_t* icon = isZoomed ? L"⤡" : L"⤢";
+        /* Use simple geometric glyphs that always render on Segoe UI. */
+        const wchar_t* icon = isZoomed ? L"▭" : L"▢";
         SIZE sz;
         HFONT old = (HFONT)SelectObject(dc, g_app.hFontEmoji);
         SetBkMode(dc, TRANSPARENT);
@@ -4695,7 +4778,8 @@ static void draw_terminal_header(HDC dc, RECT hdr, Tab* t, BOOL hasFocus, int ce
         RECT btn = { rightCursor - 28, hdr.top + 6, rightCursor, hdr.bottom - 6 };
         COLORREF btnBg = mix_color(acc, RGB(0,0,0), 0.35);
         draw_rounded_rect(dc, btn, btnBg, 0, 8);
-        const wchar_t* icon = L"⇲";
+        /* "↔" reads as "resize" universally, renders cleanly on Segoe UI.  */
+        const wchar_t* icon = L"↔";
         SIZE sz;
         HFONT old = (HFONT)SelectObject(dc, g_app.hFontEmoji);
         SetBkMode(dc, TRANSPARENT);
@@ -4752,10 +4836,27 @@ static void draw_terminal_header(HDC dc, RECT hdr, Tab* t, BOOL hasFocus, int ce
     }
 }
 
+/* Pick the active colour scheme for a given tab (override if set, else global). */
+static const ColorScheme* tab_scheme(const Tab* t) {
+    if (t && t->customScheme[0]) {
+        const ColorScheme* s = scheme_by_id(t->customScheme);
+        if (s) return s;
+    }
+    return current_scheme();
+}
+
+/* Pick the font height for a given tab (override or global fontPxOverride or default). */
+static int tab_font_px(const Tab* t) {
+    if (t && t->customFontSize > 0) return t->customFontSize;
+    if (g_app.fontPxOverride > 0)   return g_app.fontPxOverride;
+    return 16;                                       /* fallback */
+}
+
 /* Render one terminal cell. cellIdx ∈ [0..MAX_SPLIT_CELLS-1] or -1 (single
  * tab mode). hasFocus draws the focus border in split mode.            */
 static void draw_terminal_cell(HDC dc, const RECT* rc, int tabIdx, BOOL hasFocus, int cellIdx) {
-    const ColorScheme* sc = current_scheme();
+    const Tab* tForScheme = (tabIdx >= 0 && tabIdx < g_app.tabCount) ? g_app.tabs[tabIdx] : NULL;
+    const ColorScheme* sc = tab_scheme(tForScheme);
     fill_rect_color(dc, rc, sc->bg);
 
     if (tabIdx < 0 || tabIdx >= g_app.tabCount) {
@@ -4943,7 +5044,7 @@ static const ToolbarAction kToolbarActions[] = {
     { L"✂",     L"Limpar",   NULL,       RGB(0xC0, 0xCA, 0xF5), 1 },
     { L"\U0001F4A1", L"Explicar", NULL,       RGB(0xE0, 0xAF, 0x68), 3 },
     { L"▦",     L"Layout",   NULL,       RGB(0xBB, 0x9A, 0xF7), 5 },
-    { L"\U0001F6AA", L"Sair split", NULL,    RGB(0xF7, 0x76, 0x8E), 6 },
+    { L"↩",     L"Sair split", NULL,    RGB(0xF7, 0x76, 0x8E), 6 },
     { L"⚙",     L"Config",   NULL,       RGB(0x7A, 0xA2, 0xF7), 4 },
 };
 #define TOOLBAR_ACTION_COUNT (sizeof(kToolbarActions)/sizeof(kToolbarActions[0]))
@@ -5619,6 +5720,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_BAR_CLASSES | ICC_STANDARD_CLASSES };
             InitCommonControlsEx(&icc);
             g_app.hWnd = hWnd;
+            DragAcceptFiles(hWnd, TRUE);   /* accept Explorer drag&drop */
             g_app.brBg       = CreateSolidBrush(COL_BG);
             g_app.brBgSide   = CreateSolidBrush(COL_BG_SIDE);
             g_app.brBgTabBar = CreateSolidBrush(COL_BG_TABBAR);
@@ -6065,6 +6167,36 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_app.pendingRepaint = 1;
             }
             free(heap);
+            return 0;
+        }
+
+        case WM_DROPFILES: {
+            HDROP hDrop = (HDROP)wParam;
+            UINT n = DragQueryFileW(hDrop, 0xFFFFFFFF, NULL, 0);
+            for (UINT i = 0; i < n; ++i) {
+                wchar_t path[MAX_PATH] = {0};
+                DragQueryFileW(hDrop, i, path, MAX_PATH);
+                DWORD attr = GetFileAttributesW(path);
+                if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+                    /* Folder → new tab opened with `cd "<path>"`. */
+                    open_new_tab(L"powershell");
+                    Tab* nt = g_app.tabs[g_app.tabCount - 1];
+                    str_copy_w(nt->title, 128, wcsrchr(path, L'\\') ? wcsrchr(path, L'\\') + 1 : path);
+                    str_copy_w(nt->emoji, 8, L"\U0001F4C1");
+                    wchar_t cmd[MAX_PATH + 16];
+                    _snwprintf_s(cmd, MAX_PATH + 16, _TRUNCATE, L"cd \"%s\"\r", path);
+                    /* Wait a beat for the shell to settle. */
+                    Sleep(150);
+                    inject_into_active(cmd);
+                } else {
+                    /* File → inject quoted path into active terminal. */
+                    wchar_t buf[MAX_PATH + 8];
+                    _snwprintf_s(buf, MAX_PATH + 8, _TRUNCATE, L"\"%s\" ", path);
+                    inject_into_active(buf);
+                }
+            }
+            DragFinish(hDrop);
+            SetForegroundWindow(hWnd);
             return 0;
         }
 
