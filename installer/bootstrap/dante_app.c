@@ -43,6 +43,7 @@
 #include <mmsystem.h>
 #include <wincrypt.h>
 #include <dpapi.h>
+#include <richedit.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -74,7 +75,7 @@ static PFN_ClosePseudoConsole  pClosePseudoConsole  = NULL;
  *                              CONSTANTS
  * ========================================================================= */
 
-#define APP_VERSION_W   L"1.0.29"
+#define APP_VERSION_W   L"1.0.30"
 #define APP_NAME_W      L"Dante CLI"
 #define APP_WINDOW_CLS  L"DanteCLIMainWindow"
 
@@ -491,6 +492,7 @@ typedef struct {
     /* Per-tab appearance override. Empty/0 = inherit global Settings. */
     wchar_t      customScheme[32];
     int          customFontSize;
+    wchar_t      customFontFamily[64];
 } Tab;
 
 /* =========================================================================
@@ -1453,6 +1455,9 @@ static void persist_save(void) {
         if (t->customFontSize > 0) {
             fwprintf(f, L", \"fontSize\": %d", t->customFontSize);
         }
+        if (t->customFontFamily[0]) {
+            fwprintf(f, L", \"fontFamily\": "); json_write_string(f, t->customFontFamily);
+        }
         fwprintf(f, L"}%ls\n", (i + 1 < g_app.tabCount) ? L"," : L"");
     }
     fwprintf(f, L"  ],\n");
@@ -1638,6 +1643,11 @@ static void on_tab_object(const wchar_t* s, const wchar_t* e) {
         if (fk && fk < e) {
             const wchar_t* col = wcschr(fk, L':');
             if (col && col < e) { col++; while (*col == L' ') ++col; t->customFontSize = _wtoi(col); }
+        }
+        const wchar_t* ff = wcsstr(s, L"\"fontFamily\"");
+        if (ff && ff < e) {
+            const wchar_t* col = wcschr(ff, L':');
+            if (col && col < e) read_json_string(col + 1, t->customFontFamily, 64);
         }
     }
 
@@ -2149,7 +2159,29 @@ enum {
     IDM_TAB_SCHEME_BASE  = 0x1300,    /* +0..SCHEME_COUNT-1 */
     IDM_TAB_FONTSIZE_BASE = 0x1400,   /* +9..28 inclusive */
     IDM_TAB_RESET_LOOK    = 0x14FF,   /* clear per-tab override */
+    IDM_TAB_FONTFAM_BASE  = 0x1500,   /* +0..FONT_FAMILY_COUNT-1 */
 };
+
+/* Curated list of monospace families. Order matters — first entry is the
+ * default fallback ("inherit global"). If a family isn't installed on the
+ * user's system, the wider Win32 font matcher falls back to Cascadia Code
+ * automatically (we don't validate up-front).                            */
+static const wchar_t* kFontFamilies[] = {
+    L"Cascadia Code",
+    L"Cascadia Mono",
+    L"Consolas",
+    L"Courier New",
+    L"Lucida Console",
+    L"JetBrains Mono",
+    L"Fira Code",
+    L"Source Code Pro",
+    L"Hack",
+    L"Inconsolata",
+    L"Ubuntu Mono",
+    L"DejaVu Sans Mono",
+    L"Monaco",
+};
+#define FONT_FAMILY_COUNT ((int)(sizeof(kFontFamilies) / sizeof(kFontFamilies[0])))
 
 /* Curated set of "developer-friendly" emoji shown in the picker. */
 static const wchar_t* kEmojiPalette[] = {
@@ -2361,6 +2393,16 @@ static void show_tab_context_menu(HWND hWnd, int tabIdx, int x, int y) {
         }
         AppendMenuW(app_menu, MF_POPUP, (UINT_PTR)schemes, L"Tema");
 
+        HMENU families = CreatePopupMenu();
+        for (int i = 0; i < FONT_FAMILY_COUNT; ++i) {
+            UINT flags = MF_STRING;
+            if (g_app.tabs[tabIdx]->customFontFamily[0] &&
+                _wcsicmp(g_app.tabs[tabIdx]->customFontFamily, kFontFamilies[i]) == 0)
+                flags |= MF_CHECKED;
+            AppendMenuW(families, flags, IDM_TAB_FONTFAM_BASE + i, kFontFamilies[i]);
+        }
+        AppendMenuW(app_menu, MF_POPUP, (UINT_PTR)families, L"Fonte");
+
         HMENU sizes = CreatePopupMenu();
         for (int s = 9; s <= 28; ++s) {
             wchar_t lbl[16];
@@ -2372,7 +2414,8 @@ static void show_tab_context_menu(HWND hWnd, int tabIdx, int x, int y) {
         AppendMenuW(app_menu, MF_POPUP, (UINT_PTR)sizes, L"Tamanho da fonte");
 
         if (g_app.tabs[tabIdx]->customScheme[0] ||
-            g_app.tabs[tabIdx]->customFontSize > 0) {
+            g_app.tabs[tabIdx]->customFontSize > 0 ||
+            g_app.tabs[tabIdx]->customFontFamily[0]) {
             AppendMenuW(app_menu, MF_SEPARATOR, 0, NULL);
             AppendMenuW(app_menu, MF_STRING, IDM_TAB_RESET_LOOK,
                         L"Voltar ao padrão global");
@@ -2430,9 +2473,15 @@ static void show_tab_context_menu(HWND hWnd, int tabIdx, int x, int y) {
     } else if (cmd >= IDM_TAB_FONTSIZE_BASE + 9 && cmd <= IDM_TAB_FONTSIZE_BASE + 28) {
         g_app.tabs[tabIdx]->customFontSize = cmd - IDM_TAB_FONTSIZE_BASE;
         schedule_persist();
+    } else if (cmd >= IDM_TAB_FONTFAM_BASE &&
+               cmd <  IDM_TAB_FONTFAM_BASE + FONT_FAMILY_COUNT) {
+        int idx = cmd - IDM_TAB_FONTFAM_BASE;
+        str_copy_w(g_app.tabs[tabIdx]->customFontFamily, 64, kFontFamilies[idx]);
+        schedule_persist();
     } else if (cmd == IDM_TAB_RESET_LOOK) {
         g_app.tabs[tabIdx]->customScheme[0] = 0;
         g_app.tabs[tabIdx]->customFontSize = 0;
+        g_app.tabs[tabIdx]->customFontFamily[0] = 0;
         schedule_persist();
     }
 
@@ -3091,13 +3140,22 @@ static LRESULT CALLBACK EditorWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
                 0, 0, 0, 0, hWnd, NULL, GetModuleHandleW(NULL), NULL);
             SendMessageW(g_editorCtx->hPathLabel, WM_SETFONT, (WPARAM)f, TRUE);
 
-            g_editorCtx->hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            /* RichEdit 5.0 (msftedit.dll) — unlimited undo, better
+             * keyboard handling than the plain EDIT class.            */
+            g_editorCtx->hEdit = CreateWindowExW(WS_EX_CLIENTEDGE,
+                L"RICHEDIT50W", L"",
                 WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_WANTRETURN |
                 WS_VSCROLL | WS_HSCROLL | ES_AUTOVSCROLL | ES_AUTOHSCROLL |
                 ES_READONLY,
                 0, 0, 0, 0, hWnd, NULL, GetModuleHandleW(NULL), NULL);
             SendMessageW(g_editorCtx->hEdit, WM_SETFONT, (WPARAM)g_app.hFontMono, TRUE);
-            SendMessageW(g_editorCtx->hEdit, EM_SETLIMITTEXT, (WPARAM)(512 * 1024), 0);
+            SendMessageW(g_editorCtx->hEdit, EM_EXLIMITTEXT, 0, (LPARAM)(512 * 1024));
+            /* Enable rich change notifications so EN_CHANGE fires reliably */
+            SendMessageW(g_editorCtx->hEdit, EM_SETEVENTMASK, 0, ENM_CHANGE | ENM_KEYEVENTS);
+            /* Tell RichEdit to ask the parent before opening URLs etc. */
+            SendMessageW(g_editorCtx->hEdit, EM_AUTOURLDETECT, FALSE, 0);
+            /* Bigger undo stack */
+            SendMessageW(g_editorCtx->hEdit, EM_SETUNDOLIMIT, 100, 0);
 
             g_editorCtx->hToggleBtn = CreateWindowExW(0, L"BUTTON", L"✎  Editar",
                 WS_CHILD | WS_VISIBLE,
@@ -3177,7 +3235,14 @@ static LRESULT CALLBACK EditorWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
+/* Lazily load msftedit.dll so we can use the modern RichEdit class. */
+static void ensure_richedit_loaded(void) {
+    static HMODULE h = NULL;
+    if (!h) h = LoadLibraryW(L"msftedit.dll");
+}
+
 static void show_editor_preview(const wchar_t* path) {
+    ensure_richedit_loaded();
     static BOOL registered = FALSE;
     if (!registered) {
         WNDCLASSEXW wc = { sizeof(wc) };
@@ -5182,18 +5247,22 @@ static void draw_terminal_cell(HDC dc, const RECT* rc, int tabIdx, BOOL hasFocus
     const int TERM_PAD_X = 20;
     const int TERM_PAD_Y = 14;
 
-    /* Per-tab font override: when t->customFontSize > 0 we build a temporary
-     * font and use it instead of g_app.hFontMono. cellW/cellH are also
-     * remeasured locally so the grid sizing matches.                     */
+    /* Per-tab font override (family and/or size). When either is set, build
+     * a local font for this paint and remeasure cellW/cellH so the grid
+     * lays out correctly. The temporary fonts are freed at end-of-function.*/
     HFONT localMono = NULL, localMonoBold = NULL;
     int localW = g_app.cellW, localH = g_app.cellH;
-    if (t->customFontSize > 0) {
-        localMono = CreateFontW(-t->customFontSize, 0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,
+    BOOL hasFontOverride = (t->customFontSize > 0) || (t->customFontFamily[0] != 0);
+    if (hasFontOverride) {
+        int fontPx = t->customFontSize > 0 ? t->customFontSize :
+                     (g_app.fontPxOverride > 0 ? g_app.fontPxOverride : 16);
+        const wchar_t* family = t->customFontFamily[0] ? t->customFontFamily : L"Cascadia Code";
+        localMono = CreateFontW(-fontPx, 0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Cascadia Code");
-        localMonoBold = CreateFontW(-t->customFontSize, 0,0,0,FW_BOLD,FALSE,FALSE,FALSE,
+            CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, family);
+        localMonoBold = CreateFontW(-fontPx, 0,0,0,FW_BOLD,FALSE,FALSE,FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Cascadia Code");
+            CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, family);
         HFONT oldM = (HFONT)SelectObject(dc, localMono);
         TEXTMETRICW tm;
         GetTextMetricsW(dc, &tm);
@@ -5206,7 +5275,7 @@ static void draw_terminal_cell(HDC dc, const RECT* rc, int tabIdx, BOOL hasFocus
     int areaW = (rc->right - rc->left) - 2 * TERM_PAD_X;
     int areaH = (rc->bottom - rc->top) - 2 * TERM_PAD_Y;
     if (g_app.cellW == 0 || g_app.cellH == 0) measure_cell(dc);
-    if (t->customFontSize == 0) { localW = g_app.cellW; localH = g_app.cellH; }
+    if (!hasFontOverride) { localW = g_app.cellW; localH = g_app.cellH; }
     int cols = max_int(20, areaW / max_int(1, localW));
     int rows = max_int(5,  areaH / max_int(1, localH));
     cols = min_int(cols, MAX_COLS);

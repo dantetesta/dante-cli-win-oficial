@@ -3,6 +3,23 @@
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 Versionamento [SemVer](https://semver.org/lang/pt-BR/).
 
+## [1.0.30] — 2026-05-20
+
+### Adicionado
+- **Família de fonte por aba** — submenu **Aparência → Fonte** com 13 fontes monospace curadas: Cascadia Code/Mono, Consolas, Courier New, Lucida Console, JetBrains Mono, Fira Code, Source Code Pro, Hack, Inconsolata, Ubuntu Mono, DejaVu Sans Mono, Monaco. Se a fonte escolhida não estiver instalada, o matcher do Win32 cai pra Cascadia Code silenciosamente.
+- Quando a aba tem `customFontFamily` E/OU `customFontSize`, a célula é renderizada com fonte local construída em runtime, com `cellW/cellH` recalculados — funciona em modo single-tab e em qualquer split.
+- "Voltar ao padrão global" no menu zera **família + tamanho + tema** numa só ação.
+- Persistência: `fontFamily` salvo no `state.json` por aba.
+
+### Editor
+- **Trocado `EDIT` por `RICHEDIT50W`** (msftedit.dll). Ganhos:
+  - **Undo ilimitado** (limit 100 passos; antes era 1)
+  - Melhor handling de Unicode e seleções
+  - `EM_EXLIMITTEXT` em 512 KB de texto
+  - `EM_AUTOURLDETECT` desativado pra não interferir em paths
+  - `EM_SETEVENTMASK` com `ENM_CHANGE` garante que o flag "dirty" sempre dispara
+- Ctrl+S salva, Ctrl+Z desfaz, Ctrl+Y/Ctrl+Shift+Z refaz — tudo nativo do RichEdit.
+
 ## [1.0.29] — 2026-05-20
 
 ### Adicionado
