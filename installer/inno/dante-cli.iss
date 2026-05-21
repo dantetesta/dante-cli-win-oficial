@@ -5,7 +5,7 @@
 ; Read at compile time: distribution dir = ..\..\dist\Release
 
 #define MyAppName        "Dante CLI"
-#define MyAppVersion     "1.0.30"
+#define MyAppVersion     "1.0.31"
 #define MyAppPublisher   "Dante"
 #define MyAppURL         "https://dante.cli"
 #define MyAppExeName     "Dante CLI.exe"

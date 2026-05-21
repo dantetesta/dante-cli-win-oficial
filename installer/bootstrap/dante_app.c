@@ -75,7 +75,7 @@ static PFN_ClosePseudoConsole  pClosePseudoConsole  = NULL;
  *                              CONSTANTS
  * ========================================================================= */
 
-#define APP_VERSION_W   L"1.0.30"
+#define APP_VERSION_W   L"1.0.31"
 #define APP_NAME_W      L"Dante CLI"
 #define APP_WINDOW_CLS  L"DanteCLIMainWindow"
 
@@ -3015,11 +3015,235 @@ static BOOL is_text_file(const wchar_t* path) {
     return FALSE;
 }
 
+/* =====================================================================
+ *                  EDITOR SYNTAX HIGHLIGHTING
+ *
+ * Tiny hand-rolled tokenizer over the RichEdit content. We pick a
+ * language family from the extension, then walk the buffer char by char
+ * recognising:  comments / strings / numbers / keywords. Each token is
+ * styled via EM_SETCHARFORMAT on a transient selection. Cursor and view
+ * are preserved across the pass. Performance is fine up to ~512 KB.
+ * ===================================================================== */
+
+typedef enum {
+    LANG_NONE = 0,
+    LANG_CLIKE,   /* C/C++/C#/Java/JS/TS/Go/Rust/PHP/Swift/Kotlin */
+    LANG_PYISH,   /* Python/Ruby/Shell */
+    LANG_MARKUP,  /* HTML/XML/SVG */
+    LANG_CSSISH,  /* CSS/SCSS/SASS */
+    LANG_JSON,    /* JSON/JSONC */
+    LANG_MARKDOWN,
+} Lang;
+
+static Lang detect_language(const wchar_t* path) {
+    const wchar_t* dot = wcsrchr(path, L'.');
+    if (!dot) return LANG_NONE;
+    if (!_wcsicmp(dot, L".c")    || !_wcsicmp(dot, L".h")   ||
+        !_wcsicmp(dot, L".cpp")  || !_wcsicmp(dot, L".hpp") ||
+        !_wcsicmp(dot, L".cc")   || !_wcsicmp(dot, L".hh")  ||
+        !_wcsicmp(dot, L".cs")   || !_wcsicmp(dot, L".java")||
+        !_wcsicmp(dot, L".js")   || !_wcsicmp(dot, L".jsx") ||
+        !_wcsicmp(dot, L".ts")   || !_wcsicmp(dot, L".tsx") ||
+        !_wcsicmp(dot, L".go")   || !_wcsicmp(dot, L".rs")  ||
+        !_wcsicmp(dot, L".php")  || !_wcsicmp(dot, L".kt")  ||
+        !_wcsicmp(dot, L".swift")|| !_wcsicmp(dot, L".m")   ||
+        !_wcsicmp(dot, L".mm")) return LANG_CLIKE;
+    if (!_wcsicmp(dot, L".py") || !_wcsicmp(dot, L".rb") ||
+        !_wcsicmp(dot, L".sh") || !_wcsicmp(dot, L".bash") ||
+        !_wcsicmp(dot, L".zsh")|| !_wcsicmp(dot, L".ps1") ||
+        !_wcsicmp(dot, L".psm1")|| !_wcsicmp(dot, L".yaml") ||
+        !_wcsicmp(dot, L".yml")|| !_wcsicmp(dot, L".toml") ||
+        !_wcsicmp(dot, L".ini")|| !_wcsicmp(dot, L".env")) return LANG_PYISH;
+    if (!_wcsicmp(dot, L".html") || !_wcsicmp(dot, L".htm") ||
+        !_wcsicmp(dot, L".xml")  || !_wcsicmp(dot, L".svg")) return LANG_MARKUP;
+    if (!_wcsicmp(dot, L".css")  || !_wcsicmp(dot, L".scss") ||
+        !_wcsicmp(dot, L".sass")) return LANG_CSSISH;
+    if (!_wcsicmp(dot, L".json") || !_wcsicmp(dot, L".jsonc")) return LANG_JSON;
+    if (!_wcsicmp(dot, L".md")   || !_wcsicmp(dot, L".markdown")) return LANG_MARKDOWN;
+    return LANG_NONE;
+}
+
+/* Generous union of keywords across the clike + pyish families. The
+ * highlighter just asks "is this identifier in any of these lists?".  */
+static const wchar_t* kKeywordsClike[] = {
+    L"if", L"else", L"for", L"while", L"do", L"switch", L"case", L"default",
+    L"break", L"continue", L"return", L"goto", L"sizeof", L"typeof",
+    L"int", L"char", L"long", L"short", L"float", L"double", L"void", L"bool",
+    L"signed", L"unsigned", L"struct", L"enum", L"union", L"typedef",
+    L"static", L"const", L"extern", L"volatile", L"inline", L"register",
+    L"class", L"public", L"private", L"protected", L"virtual", L"override",
+    L"new", L"delete", L"try", L"catch", L"throw", L"throws", L"finally",
+    L"function", L"var", L"let", L"const", L"async", L"await", L"yield",
+    L"import", L"export", L"from", L"as", L"package",
+    L"namespace", L"using", L"interface", L"implements", L"extends",
+    L"this", L"super", L"self", L"null", L"nullptr", L"true", L"false",
+    L"void", L"auto", L"decltype", L"explicit", L"friend", L"mutable",
+    L"operator", L"template", L"typename",
+    L"func", L"fn", L"impl", L"trait", L"mod", L"pub", L"crate",
+    L"interface", L"abstract", L"final", L"sealed",
+    NULL
+};
+
+static const wchar_t* kKeywordsPy[] = {
+    L"def", L"class", L"import", L"from", L"as", L"if", L"elif", L"else",
+    L"for", L"while", L"break", L"continue", L"return", L"yield", L"pass",
+    L"try", L"except", L"finally", L"raise", L"with", L"global", L"nonlocal",
+    L"lambda", L"and", L"or", L"not", L"is", L"in", L"None", L"True", L"False",
+    L"echo", L"exit", L"export", L"source", L"function", L"local", L"readonly",
+    L"set", L"unset", L"if", L"fi", L"then", L"else", L"elif", L"do", L"done",
+    NULL
+};
+
+static BOOL is_keyword_in(const wchar_t* word, const wchar_t** list) {
+    for (int i = 0; list[i]; ++i)
+        if (wcscmp(word, list[i]) == 0) return TRUE;
+    return FALSE;
+}
+
+static BOOL is_keyword_for(const wchar_t* word, Lang lang) {
+    switch (lang) {
+        case LANG_CLIKE:    return is_keyword_in(word, kKeywordsClike);
+        case LANG_PYISH:    return is_keyword_in(word, kKeywordsPy);
+        case LANG_JSON:     return (wcscmp(word, L"true") == 0 ||
+                                    wcscmp(word, L"false") == 0 ||
+                                    wcscmp(word, L"null") == 0);
+        default: return FALSE;
+    }
+}
+
+/* Per-token style colors. Roughly Tokyo Night. */
+#define SH_FG_KEYWORD   RGB(0xBB, 0x9A, 0xF7)
+#define SH_FG_STRING    RGB(0x9E, 0xCE, 0x6A)
+#define SH_FG_NUMBER    RGB(0xFF, 0x9E, 0x64)
+#define SH_FG_COMMENT   RGB(0x56, 0x5F, 0x89)
+#define SH_FG_DEFAULT   RGB(0xC0, 0xCA, 0xF5)
+#define SH_BG_EDITOR    RGB(0x1A, 0x1B, 0x26)
+
+static void rich_set_color(HWND hEdit, int start, int end, COLORREF c) {
+    CHARRANGE cr = { start, end };
+    SendMessageW(hEdit, EM_EXSETSEL, 0, (LPARAM)&cr);
+    CHARFORMAT2W cf = {0};
+    cf.cbSize = sizeof(cf);
+    cf.dwMask = CFM_COLOR;
+    cf.crTextColor = c;
+    SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+}
+
+static void apply_syntax_highlight(HWND hEdit, Lang lang) {
+    if (lang == LANG_NONE || lang == LANG_MARKDOWN ||
+        lang == LANG_MARKUP || lang == LANG_CSSISH) {
+        /* For markup/css we'd need a stateful HTML tag parser — out of
+         * scope here; fall back to plain rendering.                  */
+    }
+
+    int total = GetWindowTextLengthW(hEdit);
+    if (total <= 0 || total > 256 * 1024) return;  /* skip huge buffers */
+
+    wchar_t* buf = (wchar_t*)malloc((total + 2) * sizeof(wchar_t));
+    if (!buf) return;
+    GetWindowTextW(hEdit, buf, total + 1);
+
+    /* Save cursor/scroll and freeze rendering. */
+    CHARRANGE savedSel; SendMessageW(hEdit, EM_EXGETSEL, 0, (LPARAM)&savedSel);
+    POINT savedScroll; SendMessageW(hEdit, EM_GETSCROLLPOS, 0, (LPARAM)&savedScroll);
+    SendMessageW(hEdit, WM_SETREDRAW, FALSE, 0);
+
+    /* 1) Reset everything to default colour. */
+    {
+        CHARRANGE all = { 0, -1 };
+        SendMessageW(hEdit, EM_EXSETSEL, 0, (LPARAM)&all);
+        CHARFORMAT2W cf = {0};
+        cf.cbSize = sizeof(cf);
+        cf.dwMask = CFM_COLOR;
+        cf.crTextColor = SH_FG_DEFAULT;
+        SendMessageW(hEdit, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
+    }
+
+    /* Decide comment & string syntax per language. */
+    BOOL hashComment = (lang == LANG_PYISH);
+    BOOL slashComment = (lang == LANG_CLIKE || lang == LANG_CSSISH);
+    BOOL blockComment = (lang == LANG_CLIKE || lang == LANG_CSSISH);
+
+    int i = 0;
+    while (i < total) {
+        wchar_t c = buf[i];
+
+        /* Line comment */
+        if ((hashComment && c == L'#') ||
+            (slashComment && c == L'/' && i + 1 < total && buf[i+1] == L'/')) {
+            int s = i;
+            while (i < total && buf[i] != L'\n') ++i;
+            rich_set_color(hEdit, s, i, SH_FG_COMMENT);
+            continue;
+        }
+        /* Block comment /* ... */
+        if (blockComment && c == L'/' && i + 1 < total && buf[i+1] == L'*') {
+            int s = i;
+            i += 2;
+            while (i + 1 < total && !(buf[i] == L'*' && buf[i+1] == L'/')) ++i;
+            i = (i + 2 <= total) ? i + 2 : total;
+            rich_set_color(hEdit, s, i, SH_FG_COMMENT);
+            continue;
+        }
+        /* String "..." or '...' (no multi-line) */
+        if (c == L'"' || c == L'\'') {
+            wchar_t quote = c;
+            int s = i++;
+            while (i < total && buf[i] != quote && buf[i] != L'\n') {
+                if (buf[i] == L'\\' && i + 1 < total) ++i;
+                ++i;
+            }
+            if (i < total && buf[i] == quote) ++i;
+            rich_set_color(hEdit, s, i, SH_FG_STRING);
+            continue;
+        }
+        /* Number */
+        if (c >= L'0' && c <= L'9') {
+            int s = i;
+            while (i < total && ((buf[i] >= L'0' && buf[i] <= L'9') ||
+                                  buf[i] == L'.' || buf[i] == L'x' ||
+                                  buf[i] == L'X' ||
+                                  (buf[i] >= L'a' && buf[i] <= L'f') ||
+                                  (buf[i] >= L'A' && buf[i] <= L'F'))) ++i;
+            rich_set_color(hEdit, s, i, SH_FG_NUMBER);
+            continue;
+        }
+        /* Identifier / keyword */
+        if ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || c == L'_') {
+            int s = i;
+            while (i < total &&
+                   ((buf[i] >= L'a' && buf[i] <= L'z') ||
+                    (buf[i] >= L'A' && buf[i] <= L'Z') ||
+                    (buf[i] >= L'0' && buf[i] <= L'9') ||
+                    buf[i] == L'_')) ++i;
+            wchar_t word[64];
+            int wlen = i - s;
+            if (wlen > 0 && wlen < 64) {
+                memcpy(word, &buf[s], wlen * sizeof(wchar_t));
+                word[wlen] = 0;
+                if (is_keyword_for(word, lang))
+                    rich_set_color(hEdit, s, i, SH_FG_KEYWORD);
+            }
+            continue;
+        }
+        ++i;
+    }
+
+    /* Restore selection + scroll + redraw. */
+    SendMessageW(hEdit, EM_EXSETSEL, 0, (LPARAM)&savedSel);
+    SendMessageW(hEdit, EM_SETSCROLLPOS, 0, (LPARAM)&savedScroll);
+    SendMessageW(hEdit, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(hEdit, NULL, TRUE);
+
+    free(buf);
+}
+
 typedef struct {
     HWND     hWnd;
     HWND     hEdit;
     HWND     hPathLabel;
     HWND     hSaveBtn;
+    Lang     lang;
     HWND     hCloseBtn;
     HWND     hToggleBtn;
     wchar_t  path[MAX_PATH];
@@ -3185,14 +3409,25 @@ static LRESULT CALLBACK EditorWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
                     L"(Não foi possível abrir o arquivo — talvez seja maior que 512 KB ou tenha codificação não-UTF8.)");
             }
             g_editorCtx->dirty = FALSE;
+            g_editorCtx->lang = detect_language(g_editorCtx->path);
+            apply_syntax_highlight(g_editorCtx->hEdit, g_editorCtx->lang);
             editor_relayout(hWnd);
             SetFocus(g_editorCtx->hEdit);
             return 0;
         }
         case WM_SIZE: editor_relayout(hWnd); return 0;
+        case WM_TIMER:
+            if (wParam == 700) {
+                KillTimer(hWnd, 700);
+                apply_syntax_highlight(g_editorCtx->hEdit, g_editorCtx->lang);
+                return 0;
+            }
+            return 0;
         case WM_COMMAND:
             if (HIWORD(wParam) == EN_CHANGE && (HWND)lParam == g_editorCtx->hEdit) {
                 g_editorCtx->dirty = TRUE;
+                /* Re-highlight after 400ms of inactivity. */
+                SetTimer(hWnd, 700, 400, NULL);
                 return 0;
             }
             if (LOWORD(wParam) == 600) {

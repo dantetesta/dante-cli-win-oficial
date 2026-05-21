@@ -3,6 +3,23 @@
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 Versionamento [SemVer](https://semver.org/lang/pt-BR/).
 
+## [1.0.31] — 2026-05-20
+
+### Adicionado
+- **Syntax highlight no editor preview** — tokenizer próprio em C que reconhece e colore:
+  - **Keywords** (Tokyo Night roxo) — união generosa de C/C++/JS/TS/Java/Go/Rust/Python/Shell.
+  - **Strings** `"..."` `'...'` (verde) com suporte a escape `\`.
+  - **Números** (laranja) incluindo hexadecimal `0xFF`.
+  - **Comentários** (cinza) — `//` `/* */` para clike, `#` para Python/Bash/YAML/TOML/INI.
+- Linguagens detectadas pela extensão: C/C++/C#/Java/JS/TS/Go/Rust/PHP/Swift/Kotlin/ObjC, Python/Ruby/Shell/PowerShell/YAML/TOML/INI/env, JSON/JSONC.
+- **Aplicação no load + debounce 400 ms em EN_CHANGE** — não trava o editor enquanto digita rápido.
+- Posição do cursor e scroll são preservados durante o re-tint (via `EM_EXGETSEL` + `EM_GETSCROLLPOS`).
+- Re-render usa `WM_SETREDRAW FALSE/TRUE` para evitar flicker durante centenas de chamadas `EM_SETCHARFORMAT`.
+
+### Backlog
+- HTML / XML / CSS highlight (precisa de parser stateful de tags) — fica como TODO.
+- Conservative range — re-highlight só do parágrafo alterado em vez do buffer inteiro.
+
 ## [1.0.30] — 2026-05-20
 
 ### Adicionado
