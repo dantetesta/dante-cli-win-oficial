@@ -10,7 +10,7 @@ ManifestSupportedOS all
 ManifestDPIAware true
 
 !define APPNAME            "Dante CLI"
-!define APPVERSION         "1.0.31"
+!define APPVERSION         "1.0.34"
 !define COMPANYNAME        "Dante"
 !define APPEXE             "Dante CLI.exe"
 !define APPID              "DanteCLI"
@@ -31,10 +31,10 @@ RequestExecutionLevel admin
 ShowInstDetails show
 ShowUninstDetails show
 
-VIProductVersion "1.0.31.0"
+VIProductVersion "1.0.34.0"
 VIAddVersionKey "ProductName" "${APPNAME}"
-VIAddVersionKey "FileVersion" "1.0.31.0"
-VIAddVersionKey "ProductVersion" "1.0.31"
+VIAddVersionKey "FileVersion" "1.0.34.0"
+VIAddVersionKey "ProductVersion" "1.0.34"
 VIAddVersionKey "FileDescription" "${APPNAME} installer"
 VIAddVersionKey "LegalCopyright" "(c) ${COMPANYNAME}. MIT License."
 VIAddVersionKey "CompanyName" "${COMPANYNAME}"

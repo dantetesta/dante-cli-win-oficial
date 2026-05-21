@@ -3,6 +3,38 @@
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 Versionamento [SemVer](https://semver.org/lang/pt-BR/).
 
+## [1.0.34] — 2026-05-20
+
+### Acessibilidade
+- **Detecção de Alto Contraste do Windows** via `SystemParametersInfoW(SPI_GETHIGHCONTRAST)` no startup e em `WM_SETTINGCHANGE`. Estado é logado e expõe `g_app.highContrast` para futuras adaptações de paleta.
+- **Título da janela dinâmico** — mostra `<nome da aba ativa> — Dante CLI`. Screen readers e Alt+Tab passam a identificar o conteúdo da aba ativa.
+- `Ctrl+L` agora faz algo: pula a sidebar pro modo Favoritos rapidamente.
+
+## [1.0.33] — 2026-05-20
+
+### Adicionado
+- **Drag interno da sidebar → slot do split** (sem OLE):
+  - Pressione + segure num item da sidebar; ao mover > 5 px o cursor vira "hand" indicando drag ativo.
+  - Solte em qualquer célula do split. O comportamento depende do tipo do item:
+    - **Favorito** → cria nova aba já com `cd "<path>"` e a atribui ao slot.
+    - **Pasta** (modo Pastas) → mesmo comportamento do favorito.
+    - **Arquivo de texto** (modo Pastas) → abre no editor preview com syntax highlight.
+    - **Outro arquivo** (modo Pastas) → injeta o caminho quoted no terminal do slot.
+    - **Snippet** → injeta o comando no terminal do slot (sem Enter).
+    - **Credencial** → injeta bloco comentado no terminal do slot.
+  - Soltar sem mover (≤ 5 px) é tratado como clique simples (mesmo comportamento de antes).
+  - Drop fora de qualquer célula é ignorado (não cria tab acidental).
+
+## [1.0.32] — 2026-05-20
+
+### Adicionado
+- **Welcome screen no first-run** — quando `%APPDATA%\Dante CLI\state.json` não existe, abre um overlay grande na primeira execução:
+  - 👋 Bem-vindo ao Dante CLI
+  - 7 tips com os atalhos e workflows mais usados (Ctrl+T, Ctrl+/, Layout, Explicar, Voz, menu de contexto, drag de pasta).
+  - Footer lembrando de colar a Groq API key em Configurações.
+  - Botão **"Começar →"** dispensa; Esc também.
+- Cliques sob o overlay são absorvidos pra não bagunçar a tela.
+
 ## [1.0.31] — 2026-05-20
 
 ### Adicionado

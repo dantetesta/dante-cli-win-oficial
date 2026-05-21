@@ -75,7 +75,7 @@ static PFN_ClosePseudoConsole  pClosePseudoConsole  = NULL;
  *                              CONSTANTS
  * ========================================================================= */
 
-#define APP_VERSION_W   L"1.0.31"
+#define APP_VERSION_W   L"1.0.34"
 #define APP_NAME_W      L"Dante CLI"
 #define APP_WINDOW_CLS  L"DanteCLIMainWindow"
 
@@ -545,10 +545,20 @@ typedef struct {
     int      dragTabIdx;
     int      dragStartX;
     int      dragOffsetX;
+    /* Sidebar drag — internal drag of a favorite/snippet/cred/file item
+     * to a split cell. Stays NULL until LBUTTONDOWN hits an item.       */
+    int      sidebarDragMode;     /* -1 = none; otherwise SidebarMode */
+    int      sidebarDragIdx;
+    POINT    sidebarDragStart;
+    BOOL     sidebarDragActive;
     /* Modal state */
     BOOL     cheatsheetVisible;
+    BOOL     welcomeVisible;
+    RECT     welcomeBtnRect;
     /* Sidebar list scroll */
     int      sidebarScroll;
+    /* Accessibility */
+    BOOL     highContrast;
     /* Split workspace */
     int          splitLayout;                       /* index into kPresets[] */
     int          splitSlots[MAX_SPLIT_CELLS];       /* indices into tabs[]; -1 = empty */
@@ -3999,6 +4009,83 @@ static int hit_test_voice_stop(int x, int y) {
     return (x >= r.left && x < r.right && y >= r.top && y < r.bottom);
 }
 
+/* First-run overlay. Shown when state.json doesn't exist at startup; the
+ * "Começar" button (and Esc) dismisses it.                              */
+static void draw_welcome(HDC dc, const RECT* cli) {
+    /* Dim backdrop */
+    HBRUSH dim = CreateSolidBrush(RGB(0,0,0));
+    BLENDFUNCTION bf = { AC_SRC_OVER, 0, 200, 0 };
+    HDC tmp = CreateCompatibleDC(dc);
+    HBITMAP bmp = CreateCompatibleBitmap(dc, cli->right, cli->bottom);
+    HBITMAP oldBmp = (HBITMAP)SelectObject(tmp, bmp);
+    RECT all = *cli; FillRect(tmp, &all, dim);
+    AlphaBlend(dc, 0, 0, cli->right, cli->bottom, tmp, 0, 0, cli->right, cli->bottom, bf);
+    SelectObject(tmp, oldBmp); DeleteObject(bmp); DeleteDC(tmp); DeleteObject(dim);
+
+    /* Panel */
+    int W = 620, H = 520;
+    int x = (cli->right - W) / 2;
+    int y = (cli->bottom - H) / 2;
+    RECT panel = { x, y, x + W, y + H };
+    draw_rounded_rect(dc, panel, COL_BG_SIDE, COL_ACCENT, 16);
+
+    /* Title */
+    draw_text_w(dc, x + 32, y + 28, L"\U0001F44B  Bem-vindo ao Dante CLI",
+                COL_FG, g_app.hFontBig);
+    draw_text_w(dc, x + 32, y + 64,
+                L"Terminal nativo Windows com IA, splits, voz e tudo mais.",
+                COL_FG_DIM, g_app.hFontUI);
+
+    /* Divider */
+    HPEN pen = CreatePen(PS_SOLID, 1, COL_DIV);
+    HGDIOBJ op = SelectObject(dc, pen);
+    MoveToEx(dc, x + 24, y + 102, NULL);
+    LineTo(dc, x + W - 24, y + 102);
+    SelectObject(dc, op); DeleteObject(pen);
+
+    /* Tip rows */
+    struct { const wchar_t* key; const wchar_t* tip; } rows[] = {
+        { L"Ctrl+T",        L"Abre uma nova aba (PowerShell por padrão)" },
+        { L"Ctrl+/",        L"Mostra todos os atalhos do app" },
+        { L"▦ Layout",      L"Galeria de 21 layouts: lado a lado, grid, IDE…" },
+        { L"\U0001F4A1 Explicar",  L"Pega a saída do terminal e manda pro Groq Chat" },
+        { L"\U0001F3A4 Voz",       L"Grava o microfone e injeta a transcrição (Whisper)" },
+        { L"Botão direito na aba", L"Cor, emoji, fonte, tema, renomear, etc." },
+        { L"Arraste pasta na janela", L"Abre nova aba já com cd \"<pasta>\"" },
+    };
+    int rowY = y + 122;
+    for (size_t i = 0; i < sizeof(rows)/sizeof(rows[0]); ++i) {
+        draw_text_w(dc, x + 32,  rowY, rows[i].key, COL_ACCENT2, g_app.hFontUIBold);
+        draw_text_w(dc, x + 220, rowY, rows[i].tip, COL_FG,      g_app.hFontUI);
+        rowY += 28;
+    }
+
+    /* Footer hint + button */
+    draw_text_w(dc, x + 32, y + H - 92,
+                L"Pressione Ctrl+, para abrir as configurações e colar a sua Groq API key.",
+                COL_FG_DIM, g_app.hFontUI);
+
+    RECT btn = { x + W - 200, y + H - 56, x + W - 32, y + H - 24 };
+    draw_rounded_rect(dc, btn, COL_ACCENT, 0, 10);
+    SIZE sz;
+    HFONT oldF = (HFONT)SelectObject(dc, g_app.hFontUIBold);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255,255,255));
+    const wchar_t* lbl = L"Começar  →";
+    GetTextExtentPoint32W(dc, lbl, (int)wcslen(lbl), &sz);
+    TextOutW(dc, btn.left + ((btn.right - btn.left) - sz.cx) / 2,
+             btn.top  + ((btn.bottom - btn.top) - sz.cy) / 2,
+             lbl, (int)wcslen(lbl));
+    SelectObject(dc, oldF);
+    g_app.welcomeBtnRect = btn;
+}
+
+static int hit_test_welcome_btn(int x, int y) {
+    RECT r = g_app.welcomeBtnRect;
+    if (r.right == r.left) return 0;
+    return (x >= r.left && x < r.right && y >= r.top && y < r.bottom);
+}
+
 static void draw_cheatsheet(HDC dc, const RECT* cli) {
     static const CheatRow rows[] = {
         { L"Ctrl+T",        L"Nova aba (PowerShell)" },
@@ -5721,6 +5808,36 @@ static void draw_toolbar(HDC dc, const RECT* rc) {
  *                           STATUS BAR
  * ========================================================================= */
 
+/* Accessibility — detect Windows High Contrast mode via SPI. */
+static void detect_high_contrast(void) {
+    HIGHCONTRASTW hc = {0};
+    hc.cbSize = sizeof(hc);
+    if (SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(hc), &hc, 0)) {
+        BOOL was = g_app.highContrast;
+        g_app.highContrast = (hc.dwFlags & HCF_HIGHCONTRASTON) != 0;
+        if (was != g_app.highContrast && g_app.hWnd) {
+            LOG_INFO(L"high-contrast: %s", g_app.highContrast ? L"ON" : L"OFF");
+            InvalidateRect(g_app.hWnd, NULL, TRUE);
+        }
+    }
+}
+
+/* Keep the window title in sync with the active tab — helps screen readers
+ * and Alt+Tab labels.                                                    */
+static void update_window_title(void) {
+    if (!g_app.hWnd) return;
+    wchar_t title[256];
+    if (g_app.activeTab >= 0 && g_app.activeTab < g_app.tabCount &&
+        g_app.tabs[g_app.activeTab]) {
+        Tab* t = g_app.tabs[g_app.activeTab];
+        _snwprintf_s(title, 256, _TRUNCATE,
+                     L"%s — Dante CLI", t->title);
+    } else {
+        wcscpy_s(title, 256, L"Dante CLI");
+    }
+    SetWindowTextW(g_app.hWnd, title);
+}
+
 static void update_status(void) {
     wchar_t s[256];
     PROCESS_MEMORY_COUNTERS_EX pmc = {0};
@@ -5735,6 +5852,7 @@ static void update_status(void) {
                  L"Dante CLI %s   ·   %s   ·   %s   ·   RAM %.1f MB",
                  APP_VERSION_W, shell, cwd, mb);
     if (g_app.hStatus) SendMessageW(g_app.hStatus, SB_SETTEXTW, 0, (LPARAM)s);
+    update_window_title();
 }
 
 /* =========================================================================
@@ -6369,6 +6487,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                                             hWnd, (HMENU)IDC_STATIC, GetModuleHandleW(NULL), NULL);
 
             voice_init();
+            detect_high_contrast();
 
             /* 1 s tick — also drives the REC mm:ss label during voice
              * capture and the status-bar RAM update. */
@@ -6376,6 +6495,8 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_app.repaintTimer = SetTimer(hWnd, 2, 33, NULL);
             g_app.persistTimer = SetTimer(hWnd, 3, 1500, NULL);
             g_app.dragTabIdx = -1;
+            g_app.sidebarDragMode = -1;
+            g_app.sidebarDragIdx = -1;
             g_app.tabBarHoverIdx = -1;
             g_app.sidebarHoverIdx = -1;
             g_app.sidebarItemHoverIdx = -1;
@@ -6395,6 +6516,11 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             SetTimer(hWnd, 4, 150, NULL);
             return 0;
         }
+
+        case WM_SETTINGCHANGE:
+            /* Re-evaluate high-contrast if the user toggled it. */
+            detect_high_contrast();
+            return 0;
 
         case WM_DPICHANGED: {
             /* Win10+ PerMonitorV2 — manifest already declares awareness, this
@@ -6438,6 +6564,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             draw_toolbar(mem, &toolbarRc);
 
             if (g_app.cheatsheetVisible) draw_cheatsheet(mem, &cli);
+            if (g_app.welcomeVisible)    draw_welcome(mem, &cli);
             if (voice_is_recording() || voice_is_uploading()) draw_voice_overlay(mem, &cli);
 
             BitBlt(hdc, 0, 0, cli.right, cli.bottom, mem, 0, 0, SRCCOPY);
@@ -6455,6 +6582,15 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             RECT sideRc, tabRc, termRc, toolbarRc, statusRc;
             layout_compute(&sideRc, &tabRc, &termRc, &toolbarRc, &statusRc);
 
+            /* Welcome overlay click — only "Começar" dismisses; clicks
+             * elsewhere are absorbed so the user can't poke through.    */
+            if (g_app.welcomeVisible) {
+                if (hit_test_welcome_btn(x, y)) {
+                    g_app.welcomeVisible = FALSE;
+                    InvalidateRect(hWnd, NULL, FALSE);
+                }
+                return 0;
+            }
             if (g_app.cheatsheetVisible) { cheatsheet_toggle(); return 0; }
 
             /* Voice overlay click handling — Stop button stops recording. */
@@ -6476,7 +6612,19 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (hit_test_sidebar_add(x, y, &sideRc)) { show_add_dialog(); return 0; }
 
             int sItem = hit_test_sidebar_item(x, y, &sideRc);
-            if (sItem >= 0) { on_sidebar_item_activated(sItem); return 0; }
+            if (sItem >= 0) {
+                /* Start a potential drag — only commits to "active" once
+                 * the mouse moves past a 5 px threshold (Win32 convention).
+                 * If the user releases without moving we treat it as a
+                 * single click and run the regular activation.            */
+                g_app.sidebarDragMode = (int)g_app.sidebarMode;
+                g_app.sidebarDragIdx = sItem;
+                g_app.sidebarDragStart.x = x;
+                g_app.sidebarDragStart.y = y;
+                g_app.sidebarDragActive = FALSE;
+                SetCapture(hWnd);
+                return 0;
+            }
 
             int tab = hit_test_tab(x, y, &tabRc);
             if (tab >= 0) {
@@ -6545,6 +6693,112 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
 
         case WM_LBUTTONUP: {
+            /* Sidebar drag finishing — either committed drag or simple click. */
+            if (g_app.sidebarDragMode >= 0) {
+                ReleaseCapture();
+                int sx = LOWORD(lParam), sy = HIWORD(lParam);
+
+                if (g_app.sidebarDragActive) {
+                    RECT sideRc, tabRc, termRc, toolbarRc, statusRc;
+                    layout_compute(&sideRc, &tabRc, &termRc, &toolbarRc, &statusRc);
+                    int landedSlot = -1;
+                    /* Did we drop on a split cell? */
+                    if (g_app.splitLayout != PRESET_SINGLE &&
+                        sx >= termRc.left && sx < termRc.right &&
+                        sy >= termRc.top  && sy < termRc.bottom) {
+                        const SplitPreset* preset = &kPresets[g_app.splitLayout];
+                        for (int i = 0; i < preset->cellCount; ++i) {
+                            const SplitCell* sc = resolve_cell(i);
+                            if (!sc) continue;
+                            RECT cellRc = split_cell_rect(&termRc, sc);
+                            if (sx >= cellRc.left && sx < cellRc.right &&
+                                sy >= cellRc.top && sy < cellRc.bottom) {
+                                landedSlot = i;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (landedSlot >= 0 || (sx >= termRc.left && sx < termRc.right)) {
+                        SidebarMode mode = (SidebarMode)g_app.sidebarDragMode;
+                        int idx = g_app.sidebarDragIdx;
+                        if (mode == MODE_FAVORITES && idx < g_app.favoriteCount) {
+                            /* New tab in that folder, optionally assigned to the slot. */
+                            open_new_tab(L"powershell");
+                            int newTab = g_app.tabCount - 1;
+                            Tab* nt = g_app.tabs[newTab];
+                            str_copy_w(nt->title, 128, g_app.favorites[idx].name);
+                            str_copy_w(nt->emoji, 8, L"\U0001F4C1");
+                            wchar_t cmd[1024];
+                            _snwprintf_s(cmd, 1024, _TRUNCATE,
+                                L"cd \"%s\"\r", g_app.favorites[idx].path);
+                            Sleep(120);
+                            inject_into_active(cmd);
+                            if (landedSlot >= 0) {
+                                g_app.splitSlots[landedSlot] = newTab;
+                                g_app.splitActiveCell = landedSlot;
+                                schedule_persist();
+                            }
+                        } else if (mode == MODE_FILES && idx < g_app.filesCount && idx != 0) {
+                            wchar_t full[MAX_PATH];
+                            _snwprintf_s(full, MAX_PATH, _TRUNCATE,
+                                L"%s\\%s", g_app.filesDir, g_app.filesEntries[idx]);
+                            if (g_app.filesIsDir[idx]) {
+                                open_new_tab(L"powershell");
+                                int newTab = g_app.tabCount - 1;
+                                Tab* nt = g_app.tabs[newTab];
+                                str_copy_w(nt->title, 128, g_app.filesEntries[idx]);
+                                str_copy_w(nt->emoji, 8, L"\U0001F4C1");
+                                wchar_t cmd[MAX_PATH + 16];
+                                _snwprintf_s(cmd, MAX_PATH + 16, _TRUNCATE, L"cd \"%s\"\r", full);
+                                Sleep(120);
+                                inject_into_active(cmd);
+                                if (landedSlot >= 0) {
+                                    g_app.splitSlots[landedSlot] = newTab;
+                                    g_app.splitActiveCell = landedSlot;
+                                    schedule_persist();
+                                }
+                            } else if (is_text_file(full)) {
+                                show_editor_preview(full);
+                            } else {
+                                /* Inject path into the slot's terminal (or active). */
+                                if (landedSlot >= 0 && g_app.splitSlots[landedSlot] >= 0)
+                                    g_app.splitActiveCell = landedSlot;
+                                wchar_t buf[MAX_PATH + 8];
+                                _snwprintf_s(buf, MAX_PATH + 8, _TRUNCATE,
+                                    L"\"%s\" ", full);
+                                inject_into_active(buf);
+                            }
+                        } else if (mode == MODE_SNIPPETS && idx < g_app.snippetCount) {
+                            if (landedSlot >= 0 && g_app.splitSlots[landedSlot] >= 0)
+                                g_app.splitActiveCell = landedSlot;
+                            inject_into_active(g_app.snippets[idx].cmd);
+                        } else if (mode == MODE_CREDS && idx < g_app.credCount) {
+                            if (landedSlot >= 0 && g_app.splitSlots[landedSlot] >= 0)
+                                g_app.splitActiveCell = landedSlot;
+                            Credential* c = &g_app.creds[idx];
+                            wchar_t buf[2048];
+                            _snwprintf_s(buf, 2048, _TRUNCATE,
+                                L"# === Credencial: %s (%s) ===\r"
+                                L"# user: %s\r"
+                                L"# host: %s\r"
+                                L"# === fim ===\r",
+                                c->name, c->kind, c->user, c->host);
+                            inject_into_active(buf);
+                        }
+                    }
+                } else {
+                    /* Wasn't a drag — treat as click. */
+                    on_sidebar_item_activated(g_app.sidebarDragIdx);
+                }
+
+                g_app.sidebarDragMode = -1;
+                g_app.sidebarDragIdx = -1;
+                g_app.sidebarDragActive = FALSE;
+                InvalidateRect(hWnd, NULL, FALSE);
+                return 0;
+            }
+
             if (g_app.dragTabIdx >= 0) {
                 ReleaseCapture();
                 int x = LOWORD(lParam), y = HIWORD(lParam);
@@ -6619,6 +6873,18 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             int x = LOWORD(lParam), y = HIWORD(lParam);
             RECT sideRc, tabRc, termRc, toolbarRc, statusRc;
             layout_compute(&sideRc, &tabRc, &termRc, &toolbarRc, &statusRc);
+
+            /* Detect sidebar drag threshold (5 px). */
+            if (g_app.sidebarDragMode >= 0 && !g_app.sidebarDragActive) {
+                int dx = x - g_app.sidebarDragStart.x;
+                int dy = y - g_app.sidebarDragStart.y;
+                if (dx * dx + dy * dy > 25) {
+                    g_app.sidebarDragActive = TRUE;
+                    SetCursor(LoadCursorW(NULL, IDC_HAND));
+                }
+            }
+            if (g_app.sidebarDragActive) SetCursor(LoadCursorW(NULL, IDC_HAND));
+
             int newHoverTab = hit_test_tab(x, y, &tabRc);
             int newHoverSide = hit_test_sidebar_mode(x, y, &sideRc);
             int newHoverItem = hit_test_sidebar_item(x, y, &sideRc);
@@ -6642,7 +6908,18 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (wParam == VK_F1) { show_about(); return 0; }
             if (ctrl && wParam == 'D' && !shift) { duplicate_tab(g_app.activeTab); return 0; }
             if (ctrl && shift && wParam == 'Z') { toggle_zoom(g_app.splitActiveCell); return 0; }
+            if (ctrl && wParam == 'L' && !shift) {
+                /* Ctrl+L cycles the sidebar to its first mode for accessibility. */
+                g_app.sidebarMode = MODE_FAVORITES;
+                InvalidateRect(hWnd, NULL, FALSE);
+                return 0;
+            }
             /* Esc closes zoom if zoom is active (and cheatsheet isn't). */
+            if (g_app.welcomeVisible && wParam == VK_ESCAPE) {
+                g_app.welcomeVisible = FALSE;
+                InvalidateRect(hWnd, NULL, FALSE);
+                return 0;
+            }
             if (wParam == VK_ESCAPE && g_app.zoomedCell >= 0 && !g_app.cheatsheetVisible) {
                 g_app.zoomedCell = -1;
                 InvalidateRect(hWnd, NULL, FALSE);
@@ -6925,6 +7202,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int nShow) {
     if (!hWnd) return 2;
 
     LOG_INFO(L"Dante CLI %s starting", APP_VERSION_W);
+
+    /* First-run detection: if state.json doesn't exist yet, show the welcome
+     * overlay once. (persist_load is a no-op when the file is missing.)   */
+    {
+        wchar_t sp[MAX_PATH]; state_path(sp, MAX_PATH);
+        if (GetFileAttributesW(sp) == INVALID_FILE_ATTRIBUTES) {
+            g_app.welcomeVisible = TRUE;
+        }
+    }
+
     persist_load();
     if (g_app.tabCount == 0) open_new_tab(L"powershell");
     else g_app.activeTab = 0;
