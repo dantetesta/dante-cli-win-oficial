@@ -2,7 +2,7 @@
 
 ## Opção A — Instalador pronto (recomendado)
 
-1. Baixe `DanteCLI-Setup-1.0.22-x64.exe`.
+1. Baixe `DanteCLI-Setup-1.0.26-x64.exe`.
 2. Clique duas vezes pra executar.
 3. Aceite o aviso de UAC (precisa de admin pra escrever em `Program Files`).
 4. Siga o assistente: Welcome → License → Componentes → Diretório → Instalar.
@@ -49,7 +49,7 @@ cd DANTE-CLI-WIN
 
 ```powershell
 .\scripts\make-installer.ps1
-# → dist\installer\DanteCLI-Setup-1.0.22-x64.exe
+# → dist\installer\DanteCLI-Setup-1.0.26-x64.exe
 ```
 
 ## Desinstalação

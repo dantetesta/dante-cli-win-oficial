@@ -3,6 +3,39 @@
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 Versionamento [SemVer](https://semver.org/lang/pt-BR/).
 
+## [1.0.26] — 2026-05-20
+
+### Performance
+- **Resize debounce de 150 ms**: arrastar a borda da janela não realoca mais a matriz de células 60×/s. Timer one-shot só dispara o repaint quando o usuário para.
+- **Buffer pool no reader thread**: cada sessão aloca **um** buffer de 16 KB no início e reutiliza pra todo `ReadFile`. Antes alocava implicitamente a cada loop iteration.
+
+## [1.0.25] — 2026-05-20
+
+### Adicionado
+- **`WM_DPICHANGED` handler** real — quando o usuário arrasta a janela pra outro monitor com DPI diferente, a janela respeita o `sug` rect E zera o cache `cellW`/`cellH` pra refazer as métricas com a nova fonte na próxima paint.
+- **URL do manifest de update configurável** — campo `updateManifestUrl` em `state.json`. Se vazio, usa o GitHub raw default. Parser tiny extrai `host` e `path` de `https://…`.
+
+## [1.0.24] — 2026-05-20
+
+### Segurança
+- **DPAPI encryption da Groq API key**: ao salvar `state.json`, a key é encriptada via `CryptProtectData()` (escopo `CRYPTPROTECT_LOCAL_MACHINE`-not, só o usuário Windows atual decifra). Formato no disco: `"ENC1:<base64>"`. Backward-compat: chaves plain-text antigas continuam sendo lidas (e re-encriptadas no próximo save).
+- Logs **nunca** contêm a API key — verificado novamente.
+
+### Confiabilidade
+- **`state.json.bak`** criado **antes** de cada save. Power-loss durante write não brica mais o app.
+- **Log file rotacionado por dia** em `%APPDATA%\Dante CLI\logs\debug-YYYYMMDD.log`. Macros `LOG_INFO/LOG_WARN/LOG_ERR` com timestamp ms-precision, thread-safe via critical section.
+- Linha de startup loga versão + scheme + tabCount; útil pra reproduzir bugs.
+
+## [1.0.23] — 2026-05-20
+
+### Estabilidade — fixes vindos do code review com `native-windows-c-app`
+- **`Session.alive` agora é `volatile LONG`** + escrita via `InterlockedExchange`. Antes era `BOOL`, sujeita ao compilador cachear em registrador dentro do loop do reader thread — race silenciosa em release builds.
+- **Cache de memória por tab**: `OpenProcess + GetProcessMemoryInfo + CloseHandle` saiu do hot path do `draw_terminal_header` e foi parar no timer 1 s do `resmon_sample`. Em Grid 3×3 a 60 fps isso significou **−540 syscalls/s**.
+- **`groqApiKey` zerado com `SecureZeroMemory`** antes do load (se a nova chave for mais curta, não fica lixo no final do array) e antes do `WM_DESTROY` final.
+- **Popovers órfãos**: monitor / resize / gallery / emoji-picker são destruídos no `WM_DESTROY` do main caso o usuário feche o app com eles abertos.
+- Removida `CRITICAL_SECTION` morta (`g_app.lock`) e o arquivo `dante_cli_bootstrap.c` (placeholder antigo que nunca foi mais compilado).
+- `close_tab` reordena `splitSlots[]` e ajusta `activeTab` para que a aba focada não vire dangling — junto da limpeza do `customCells` quando o layout muda.
+
 ## [1.0.22] — 2026-05-20
 
 ### Adicionado

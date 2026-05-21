@@ -101,10 +101,6 @@ edit("installer/nsis/dante-cli.nsi", [
     (r'VIAddVersionKey "ProductVersion"\s+"[^"]+"',  f'VIAddVersionKey "ProductVersion" "{NEW}"', 0),
 ])
 
-edit("installer/bootstrap/dante_cli_bootstrap.c", [
-    (r'#define APP_VERSION\s+L"[^"]+"', f'#define APP_VERSION        L"{NEW}-stub"', 0),
-])
-
 # dante_app.c uses APP_VERSION_W (the active source file)
 edit("installer/bootstrap/dante_app.c", [
     (r'#define APP_VERSION_W\s+L"[^"]+"', f'#define APP_VERSION_W   L"{NEW}"', 0),

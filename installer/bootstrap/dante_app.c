@@ -41,6 +41,8 @@
 #include <psapi.h>
 #include <winhttp.h>
 #include <mmsystem.h>
+#include <wincrypt.h>
+#include <dpapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,7 +74,7 @@ static PFN_ClosePseudoConsole  pClosePseudoConsole  = NULL;
  *                              CONSTANTS
  * ========================================================================= */
 
-#define APP_VERSION_W   L"1.0.22"
+#define APP_VERSION_W   L"1.0.26"
 #define APP_NAME_W      L"Dante CLI"
 #define APP_WINDOW_CLS  L"DanteCLIMainWindow"
 
@@ -451,7 +453,10 @@ typedef struct {
     HANDLE hThread;
     HANDLE hJob;
     HANDLE hReaderThread;
-    BOOL   alive;
+    /* alive is set/cleared across threads. volatile prevents the reader
+     * loop from caching it in a register, and InterlockedExchange around
+     * the writes makes the transition observable on every platform.    */
+    volatile LONG alive;
     DWORD  pid;
     int    ownerTabId;   /* stable id of the Tab owning this session — used in
                           * cross-thread output messages so we never deref
@@ -469,6 +474,11 @@ typedef struct {
     Session*     session;
     TerminalGrid grid;
     AnsiParser   parser;
+    /* Cached metrics refreshed by resmon_sample() on the 1 s timer. The
+     * header paints from these — OpenProcess on every repaint was burning
+     * ~540 syscalls/s in Grid 3×3.                                       */
+    SIZE_T       cachedMemBytes;
+    double       cachedCpuPct;
 } Tab;
 
 /* =========================================================================
@@ -504,12 +514,12 @@ typedef struct {
     /* Settings */
     wchar_t    groqApiKey[128];
     wchar_t    voiceLang[16];   /* ISO-639 like "pt", "en" */
+    wchar_t    updateManifestUrl[512];  /* full HTTPS URL */
     int        fontPxOverride;  /* 0 = default */
     int        scrollbackLines;
     HBRUSH   brBg, brBgSide, brBgTabBar, brBgTerm, brBgStatus;
     HBRUSH   brBgChip, brBgChipH, brAccent;
     HPEN     penDiv, penAccent;
-    CRITICAL_SECTION lock;
     BOOL     resizeScheduled;
     UINT_PTR resizeTimer;
     UINT_PTR statsTimer;
@@ -1074,7 +1084,7 @@ static Session* session_create(const wchar_t* shellId, int cols, int rows) {
     s->hProcess = pi.hProcess;
     s->hThread  = pi.hThread;
     s->pid      = pi.dwProcessId;
-    s->alive    = TRUE;
+    InterlockedExchange(&s->alive, 1);
 
     s->hJob = CreateJobObjectW(NULL, NULL);
     if (s->hJob) {
@@ -1096,7 +1106,7 @@ fail:
 
 static void session_destroy(Session* s) {
     if (!s) return;
-    s->alive = FALSE;
+    InterlockedExchange(&s->alive, 0);
     /* Closing the pseudo console signals EOF on the child's stdin/stdout,
      * which unblocks ReadFile in the reader thread on the next iteration. */
     if (s->hPC && pClosePseudoConsole) pClosePseudoConsole(s->hPC);
@@ -1139,15 +1149,21 @@ static void session_write(Session* s, const void* data, int n) {
 /* Wire format: [int tabId][int nBytes][...nBytes of payload...] */
 static DWORD WINAPI reader_thread(LPVOID arg) {
     Session* s = (Session*)arg;
-    char buf[16 * 1024];
-    while (s->alive) {
+    /* Reusable read buffer — thread-local, allocated once per session,
+     * freed when the thread exits. Avoids 60+ malloc/s churn on shells
+     * that print large blobs (find/, dir /s, etc).                     */
+    char* buf = (char*)malloc(16 * 1024);
+    if (!buf) {
+        InterlockedExchange(&s->alive, 0);
+        return 1;
+    }
+    while (InterlockedCompareExchange(&s->alive, 1, 1)) {
         DWORD nr = 0;
-        BOOL ok = ReadFile(s->hPipeOut, buf, sizeof(buf), &nr, NULL);
+        BOOL ok = ReadFile(s->hPipeOut, buf, 16 * 1024, &nr, NULL);
         if (!ok || nr == 0) break;
 
-        /* Allocate and post to UI thread so the ANSI parser runs there.
-         * We pass a stable tab id (int) — never a Session* — so the UI
-         * thread is safe even if the Session got freed in the meantime. */
+        /* Heap-allocate the message envelope (UI thread frees it on dispatch).
+         * Tab id (int) is used as the stable identifier — never a Session*. */
         int tabId = s->ownerTabId;
         char* heap = (char*)malloc(nr + sizeof(int) * 2);
         if (!heap) continue;
@@ -1156,12 +1172,12 @@ static DWORD WINAPI reader_thread(LPVOID arg) {
         memcpy(heap + sizeof(int), &n, sizeof(int));
         memcpy(heap + sizeof(int) * 2, buf, nr);
         if (!PostMessageW(g_app.hWnd, WM_DANTE_OUTPUT, 0, (LPARAM)heap)) {
-            /* Window gone — drop the buffer cleanly. */
             free(heap);
             break;
         }
     }
-    s->alive = FALSE;
+    free(buf);
+    InterlockedExchange(&s->alive, 0);
     return 0;
 }
 
@@ -1182,6 +1198,164 @@ static void state_path(wchar_t* out, size_t cap) {
     } else {
         str_copy_w(out, cap, L"state.json");
     }
+}
+
+/* =====================================================================
+ *                       DEBUG LOG FILE
+ *
+ * %APPDATA%\Dante CLI\logs\debug-YYYYMMDD.log. Lazily opened on first write,
+ * flushed every line. Used by app_log() macros for crashes/warnings.
+ * ===================================================================== */
+
+static FILE*           g_logFile = NULL;
+static CRITICAL_SECTION g_logLock;
+static BOOL            g_logLockInit = FALSE;
+
+static void log_open_if_needed(void) {
+    if (g_logFile) return;
+    if (!g_logLockInit) { InitializeCriticalSection(&g_logLock); g_logLockInit = TRUE; }
+    wchar_t base[MAX_PATH] = {0};
+    if (!SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, base))) return;
+    wchar_t logdir[MAX_PATH];
+    _snwprintf_s(logdir, MAX_PATH, _TRUNCATE, L"%s\\Dante CLI\\logs", base);
+    CreateDirectoryW(logdir, NULL);
+    SYSTEMTIME st; GetLocalTime(&st);
+    wchar_t path[MAX_PATH];
+    _snwprintf_s(path, MAX_PATH, _TRUNCATE,
+                 L"%s\\debug-%04d%02d%02d.log",
+                 logdir, st.wYear, st.wMonth, st.wDay);
+    _wfopen_s(&g_logFile, path, L"a, ccs=UTF-8");
+}
+
+static void app_log(const wchar_t* level, const wchar_t* fmt, ...) {
+    log_open_if_needed();
+    if (!g_logFile) return;
+    EnterCriticalSection(&g_logLock);
+    SYSTEMTIME st; GetLocalTime(&st);
+    fwprintf(g_logFile, L"[%04d-%02d-%02d %02d:%02d:%02d.%03d] [%s] ",
+             st.wYear, st.wMonth, st.wDay,
+             st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, level);
+    va_list ap;
+    va_start(ap, fmt);
+    vfwprintf(g_logFile, fmt, ap);
+    va_end(ap);
+    fwprintf(g_logFile, L"\n");
+    fflush(g_logFile);
+    LeaveCriticalSection(&g_logLock);
+}
+
+#define LOG_INFO(...)  app_log(L"INF", __VA_ARGS__)
+#define LOG_WARN(...)  app_log(L"WRN", __VA_ARGS__)
+#define LOG_ERR(...)   app_log(L"ERR", __VA_ARGS__)
+
+/* =====================================================================
+ *                       DPAPI ENCRYPTION
+ *
+ * Windows Data Protection API. Encrypts a wchar_t string scoped to the
+ * current user (only the same Windows user can decrypt). We use it for
+ * the Groq API key so the JSON file never contains the raw secret.
+ *
+ * Format on disk:  "ENC1:" + base64(ciphertext)
+ * Plaintext-prefix free strings fall through unchanged on load (backward
+ * compat with older versions / state.json edited by hand).
+ * ===================================================================== */
+
+static const char* B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static char* base64_encode(const BYTE* data, DWORD len) {
+    DWORD outLen = ((len + 2) / 3) * 4 + 1;
+    char* out = (char*)malloc(outLen);
+    if (!out) return NULL;
+    DWORD o = 0;
+    for (DWORD i = 0; i < len; i += 3) {
+        DWORD b0 = data[i];
+        DWORD b1 = (i + 1 < len) ? data[i + 1] : 0;
+        DWORD b2 = (i + 2 < len) ? data[i + 2] : 0;
+        out[o++] = B64_CHARS[(b0 >> 2) & 0x3F];
+        out[o++] = B64_CHARS[((b0 << 4) | (b1 >> 4)) & 0x3F];
+        out[o++] = (i + 1 < len) ? B64_CHARS[((b1 << 2) | (b2 >> 6)) & 0x3F] : '=';
+        out[o++] = (i + 2 < len) ? B64_CHARS[b2 & 0x3F] : '=';
+    }
+    out[o] = 0;
+    return out;
+}
+
+static BYTE* base64_decode(const char* s, DWORD* outLen) {
+    int table[256] = {0};
+    for (int i = 0; i < 64; ++i) table[(unsigned char)B64_CHARS[i]] = i;
+    table[(unsigned char)'='] = 0;
+    size_t slen = strlen(s);
+    DWORD groups = (DWORD)(slen / 4);
+    BYTE* out = (BYTE*)malloc(groups * 3 + 1);
+    if (!out) return NULL;
+    DWORD o = 0;
+    for (DWORD i = 0; i < groups; ++i) {
+        DWORD v0 = table[(unsigned char)s[i*4 + 0]];
+        DWORD v1 = table[(unsigned char)s[i*4 + 1]];
+        DWORD v2 = table[(unsigned char)s[i*4 + 2]];
+        DWORD v3 = table[(unsigned char)s[i*4 + 3]];
+        out[o++] = (BYTE)((v0 << 2) | (v1 >> 4));
+        if (s[i*4 + 2] != '=') out[o++] = (BYTE)((v1 << 4) | (v2 >> 2));
+        if (s[i*4 + 3] != '=') out[o++] = (BYTE)((v2 << 6) | v3);
+    }
+    *outLen = o;
+    return out;
+}
+
+/* Encrypt plaintext (wchar_t string) → "ENC1:<base64>" malloc'd UTF-8 string. */
+static char* dpapi_encrypt_w(const wchar_t* plain) {
+    if (!plain || !plain[0]) { char* e = (char*)malloc(1); e[0] = 0; return e; }
+    DATA_BLOB in, out;
+    in.pbData = (BYTE*)plain;
+    in.cbData = (DWORD)((wcslen(plain) + 1) * sizeof(wchar_t));
+    if (!CryptProtectData(&in, L"DanteCLI.GroqKey", NULL, NULL, NULL, 0, &out)) {
+        LOG_WARN(L"CryptProtectData failed err=%lu", GetLastError());
+        return NULL;
+    }
+    char* b64 = base64_encode(out.pbData, out.cbData);
+    LocalFree(out.pbData);
+    if (!b64) return NULL;
+    size_t need = strlen(b64) + 6;
+    char* tagged = (char*)malloc(need);
+    snprintf(tagged, need, "ENC1:%s", b64);
+    free(b64);
+    return tagged;
+}
+
+/* Decrypt "ENC1:<base64>" back to wchar_t string in caller buffer. If the
+ * input doesn't carry the prefix it's treated as plaintext (legacy / edited
+ * by hand) and copied verbatim.                                          */
+static void dpapi_decrypt_w(const wchar_t* enc, wchar_t* out, size_t outCap) {
+    if (!enc || !enc[0]) { if (outCap) out[0] = 0; return; }
+    if (wcsncmp(enc, L"ENC1:", 5) != 0) {
+        str_copy_w(out, outCap, enc);
+        return;
+    }
+    /* convert wchar_t base64 → char */
+    int wlen = (int)wcslen(enc + 5);
+    char* b64 = (char*)malloc(wlen + 1);
+    for (int i = 0; i < wlen; ++i) b64[i] = (char)enc[5 + i];
+    b64[wlen] = 0;
+
+    DWORD blobLen = 0;
+    BYTE* blob = base64_decode(b64, &blobLen);
+    free(b64);
+    if (!blob) { if (outCap) out[0] = 0; return; }
+
+    DATA_BLOB in, decoded;
+    in.pbData = blob;
+    in.cbData = blobLen;
+    if (!CryptUnprotectData(&in, NULL, NULL, NULL, NULL, 0, &decoded)) {
+        LOG_WARN(L"CryptUnprotectData failed err=%lu", GetLastError());
+        if (outCap) out[0] = 0;
+        free(blob);
+        return;
+    }
+    free(blob);
+    /* decoded.pbData is a wchar_t* including the trailing NUL */
+    str_copy_w(out, outCap, (const wchar_t*)decoded.pbData);
+    SecureZeroMemory(decoded.pbData, decoded.cbData);
+    LocalFree(decoded.pbData);
 }
 
 static void json_escape(const wchar_t* in, wchar_t* out, size_t cap) {
@@ -1207,15 +1381,34 @@ static int json_write_string(FILE* f, const wchar_t* s) {
 static void persist_save(void) {
     wchar_t path[MAX_PATH];
     state_path(path, MAX_PATH);
+
+    /* Backup current state.json → state.json.bak before overwriting, so a
+     * power-loss mid-write can be recovered by hand.                    */
+    wchar_t bak[MAX_PATH];
+    _snwprintf_s(bak, MAX_PATH, _TRUNCATE, L"%s.bak", path);
+    CopyFileW(path, bak, FALSE);   /* harmless if the file doesn't exist */
+
     FILE* f = NULL;
-    if (_wfopen_s(&f, path, L"w, ccs=UTF-8") != 0 || !f) return;
+    if (_wfopen_s(&f, path, L"w, ccs=UTF-8") != 0 || !f) {
+        LOG_ERR(L"persist_save: cannot open %s", path);
+        return;
+    }
+
+    /* Encrypt the Groq key via DPAPI so the JSON never has the raw secret. */
+    char* keyEnc = dpapi_encrypt_w(g_app.groqApiKey);
+    wchar_t keyEncW[1024] = {0};
+    if (keyEnc) {
+        MultiByteToWideChar(CP_UTF8, 0, keyEnc, -1, keyEncW, 1024);
+        free(keyEnc);
+    }
 
     fwprintf(f, L"{\n");
     fwprintf(f, L"  \"version\": 1,\n");
     fwprintf(f, L"  \"sidebarMode\": %d,\n", (int)g_app.sidebarMode);
     fwprintf(f, L"  \"scheme\": ");      json_write_string(f, kSchemes[clamp_int(g_schemeIdx, 0, SCHEME_COUNT - 1)].id); fwprintf(f, L",\n");
-    fwprintf(f, L"  \"groqApiKey\": ");  json_write_string(f, g_app.groqApiKey); fwprintf(f, L",\n");
+    fwprintf(f, L"  \"groqApiKey\": ");  json_write_string(f, keyEncW); fwprintf(f, L",\n");
     fwprintf(f, L"  \"voiceLang\": ");   json_write_string(f, g_app.voiceLang); fwprintf(f, L",\n");
+    fwprintf(f, L"  \"updateManifestUrl\": "); json_write_string(f, g_app.updateManifestUrl); fwprintf(f, L",\n");
     fwprintf(f, L"  \"fontPx\": %d,\n",  g_app.fontPxOverride);
     fwprintf(f, L"  \"scrollback\": %d,\n", g_app.scrollbackLines);
 
@@ -1473,11 +1666,28 @@ static void persist_load(void) {
             if (wcscmp(kSchemes[i].id, id) == 0) { g_schemeIdx = i; break; }
         }
     }
-    /* api key + voice lang + font + scrollback */
+    /* api key + voice lang + font + scrollback — zero the field first so a
+     * shorter new value doesn't leave trailing chars from the previous one.
+     * The key may be stored either as plain text (legacy) or DPAPI-wrapped
+     * (ENC1:base64). dpapi_decrypt_w() handles both transparently.       */
     const wchar_t* gk = find_key(buf, L"groqApiKey");
-    if (gk) read_json_string(gk, g_app.groqApiKey, 128);
+    if (gk) {
+        SecureZeroMemory(g_app.groqApiKey, sizeof(g_app.groqApiKey));
+        wchar_t raw[1024] = {0};
+        read_json_string(gk, raw, 1024);
+        dpapi_decrypt_w(raw, g_app.groqApiKey, 128);
+        SecureZeroMemory(raw, sizeof(raw));
+    }
     const wchar_t* vl = find_key(buf, L"voiceLang");
-    if (vl) read_json_string(vl, g_app.voiceLang, 16);
+    if (vl) {
+        memset(g_app.voiceLang, 0, sizeof(g_app.voiceLang));
+        read_json_string(vl, g_app.voiceLang, 16);
+    }
+    const wchar_t* um = find_key(buf, L"updateManifestUrl");
+    if (um) {
+        memset(g_app.updateManifestUrl, 0, sizeof(g_app.updateManifestUrl));
+        read_json_string(um, g_app.updateManifestUrl, 512);
+    }
     const wchar_t* fp = find_key(buf, L"fontPx");
     if (fp) { fp = skip_ws(fp); g_app.fontPxOverride = _wtoi(fp); }
     const wchar_t* sbk = find_key(buf, L"scrollback");
@@ -2136,14 +2346,35 @@ typedef struct { char* url; wchar_t* version; } UpdateInfo;
 
 static DWORD WINAPI update_check_thread(LPVOID arg) {
     (void)arg;
+
+    /* Use the user-configured URL if set, else the default GitHub manifest. */
+    wchar_t host[256] = L"raw.githubusercontent.com";
+    wchar_t path[512] = L"/dantetesta/dante-cli/main/updates/win.json";
+    if (g_app.updateManifestUrl[0]) {
+        /* Tiny URL parser: https://HOST/PATH */
+        const wchar_t* u = g_app.updateManifestUrl;
+        if (wcsncmp(u, L"https://", 8) == 0) u += 8;
+        else if (wcsncmp(u, L"http://", 7) == 0) u += 7;
+        const wchar_t* slash = wcschr(u, L'/');
+        if (slash) {
+            int hlen = (int)(slash - u);
+            if (hlen > 0 && hlen < 256) {
+                wcsncpy_s(host, 256, u, hlen);
+                host[hlen] = 0;
+            }
+            str_copy_w(path, 512, slash);
+        } else {
+            str_copy_w(host, 256, u);
+            str_copy_w(path, 512, L"/");
+        }
+    }
+
     HINTERNET hSes = WinHttpOpen(L"DanteCLI/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
     if (!hSes) return 0;
-    HINTERNET hCon = WinHttpConnect(hSes, L"raw.githubusercontent.com",
-                                     INTERNET_DEFAULT_HTTPS_PORT, 0);
+    HINTERNET hCon = WinHttpConnect(hSes, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
     if (!hCon) { WinHttpCloseHandle(hSes); return 0; }
-    HINTERNET hReq = WinHttpOpenRequest(hCon, L"GET",
-        L"/dantetesta/dante-cli/main/updates/win.json",
+    HINTERNET hReq = WinHttpOpenRequest(hCon, L"GET", path,
         NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
         WINHTTP_FLAG_SECURE);
     if (!hReq) { WinHttpCloseHandle(hCon); WinHttpCloseHandle(hSes); return 0; }
@@ -2282,14 +2513,19 @@ static void resmon_sample(void) {
     double appCpu = cpu_pct_for_pid(appPid);
     g_lastAppMem  = mem_for_pid(appPid);
 
-    /* Shells */
+    /* Shells — also cache per-tab metrics so the header paint can read them
+     * without doing OpenProcess on every repaint. */
     double shCpu = 0.0;
     SIZE_T shMem = 0;
     for (int i = 0; i < g_app.tabCount; ++i) {
         Tab* t = g_app.tabs[i];
         if (!t || !t->session || !t->session->pid) continue;
-        shCpu += cpu_pct_for_pid(t->session->pid);
-        shMem += mem_for_pid(t->session->pid);
+        double tcpu = cpu_pct_for_pid(t->session->pid);
+        SIZE_T tmem = mem_for_pid(t->session->pid);
+        t->cachedCpuPct   = tcpu;
+        t->cachedMemBytes = tmem;
+        shCpu += tcpu;
+        shMem += tmem;
     }
 
     g_lastTotalCpu  = appCpu + shCpu;
@@ -2502,11 +2738,10 @@ static void monitor_paint(HDC dc, RECT cli) {
                     name, COL_FG, g_app.hFontUIBold);
 
         wchar_t info[64];
-        SIZE_T tmem = t->session ? mem_for_pid(t->session->pid) : 0;
-        double tcpu = t->session ? cpu_pct_for_pid(t->session->pid) : 0.0;
         wchar_t memBuf[16];
-        fmt_bytes(tmem, memBuf, 16);
-        _snwprintf_s(info, 64, _TRUNCATE, L"%s  ·  %.0f%%", memBuf, tcpu);
+        fmt_bytes(t->cachedMemBytes, memBuf, 16);
+        _snwprintf_s(info, 64, _TRUNCATE, L"%s  ·  %.0f%%",
+                     memBuf, t->cachedCpuPct);
         draw_text_w(dc, card.left + 38, card.top + 28,
                     info, COL_FG_DIM, g_app.hFontUI);
     }
@@ -4284,35 +4519,28 @@ static void draw_terminal_header(HDC dc, RECT hdr, Tab* t, BOOL hasFocus, int ce
 
     int zoomBtnRight = rightCursor;
 
-    /* Memory chip on the right (positioned to the LEFT of the zoom btn) */
-    if (t->session && t->session->pid) {
-        PROCESS_MEMORY_COUNTERS_EX pmc = {0};
-        pmc.cb = sizeof(pmc);
-        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
-                                FALSE, t->session->pid);
-        if (h) {
-            if (GetProcessMemoryInfo(h, (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc))) {
-                wchar_t chip[32];
-                double mb = (double)pmc.PrivateUsage / (1024.0 * 1024.0);
-                _snwprintf_s(chip, 32, _TRUNCATE,
-                             mb < 1000 ? L"%.0f M" : L"%.1f G",
-                             mb < 1000 ? mb : mb / 1024.0);
-                SIZE sz;
-                HFONT oldF = (HFONT)SelectObject(dc, g_app.hFontUI);
-                GetTextExtentPoint32W(dc, chip, (int)wcslen(chip), &sz);
-                RECT chipRc = {
-                    zoomBtnRight - sz.cx - 12, hdr.top + 8,
-                    zoomBtnRight,              hdr.bottom - 8
-                };
-                COLORREF chipBg = mix_color(acc, RGB(0,0,0), 0.35);
-                draw_rounded_rect(dc, chipRc, chipBg, 0, 10);
-                SetTextColor(dc, fg);
-                TextOutW(dc, chipRc.left + 6, chipRc.top + 3,
-                         chip, (int)wcslen(chip));
-                SelectObject(dc, oldF);
-            }
-            CloseHandle(h);
-        }
+    /* Memory chip on the right — reads from the cache populated by the
+     * 1 s timer instead of doing OpenProcess every paint.              */
+    if (t->cachedMemBytes > 0) {
+        wchar_t chip[32];
+        double mb = (double)t->cachedMemBytes / (1024.0 * 1024.0);
+        _snwprintf_s(chip, 32, _TRUNCATE,
+                     mb < 1000 ? L"%.0f M" : L"%.1f G",
+                     mb < 1000 ? mb : mb / 1024.0);
+        SIZE sz;
+        HFONT oldF = (HFONT)SelectObject(dc, g_app.hFontUI);
+        GetTextExtentPoint32W(dc, chip, (int)wcslen(chip), &sz);
+        RECT chipRc = {
+            zoomBtnRight - sz.cx - 12, hdr.top + 8,
+            zoomBtnRight,              hdr.bottom - 8
+        };
+        COLORREF chipBg = mix_color(acc, RGB(0,0,0), 0.35);
+        draw_rounded_rect(dc, chipRc, chipBg, 0, 10);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, fg);
+        TextOutW(dc, chipRc.left + 6, chipRc.top + 3,
+                 chip, (int)wcslen(chip));
+        SelectObject(dc, oldF);
     }
 
     /* Subtle separator at the bottom of the header. */
@@ -5104,7 +5332,6 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                                             0, 0, 0, 0,
                                             hWnd, (HMENU)IDC_STATIC, GetModuleHandleW(NULL), NULL);
 
-            InitializeCriticalSection(&g_app.lock);
             voice_init();
 
             /* 1 s tick — also drives the REC mm:ss label during voice
@@ -5126,6 +5353,31 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case WM_SIZE: {
             if (g_app.hStatus) SendMessageW(g_app.hStatus, WM_SIZE, 0, 0);
+            /* Debounce — terminal_grid_resize allocates new Cell arrays on
+             * every grid change; doing it 60×/s during a window drag wastes
+             * megabytes. Defer to a 150 ms one-shot timer.                */
+            SetTimer(hWnd, 4, 150, NULL);
+            return 0;
+        }
+
+        case WM_DPICHANGED: {
+            /* Win10+ PerMonitorV2 — manifest already declares awareness, this
+             * handler is responsible for honoring the suggested rect AND
+             * refreshing the cached cellW/cellH so terminal text scales.   */
+            UINT dpi = HIWORD(wParam);
+            LOG_INFO(L"WM_DPICHANGED dpi=%u", dpi);
+            const RECT* sug = (const RECT*)lParam;
+            if (sug) {
+                SetWindowPos(hWnd, NULL,
+                             sug->left, sug->top,
+                             sug->right - sug->left,
+                             sug->bottom - sug->top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            /* Force cell remeasure next paint by zeroing the cached metrics. */
+            g_app.cellW = 0;
+            g_app.cellH = 0;
+            InvalidateRect(hWnd, NULL, TRUE);
             return 0;
         }
 
@@ -5386,6 +5638,11 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 if (g_app.pendingRepaint) { g_app.pendingRepaint = 0; InvalidateRect(hWnd, NULL, FALSE); }
             } else if (wParam == 3) {
                 if (g_app.pendingPersist) { g_app.pendingPersist = 0; persist_save(); }
+            } else if (wParam == 4) {
+                /* Resize debounce expired — kill the one-shot and repaint
+                 * so the grid is recomputed exactly once for the new size. */
+                KillTimer(hWnd, 4);
+                InvalidateRect(hWnd, NULL, FALSE);
             }
             return 0;
 
@@ -5481,6 +5738,17 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case WM_DESTROY:
             persist_save();
+            /* Tear down any orphan popovers so they don't outlive us as
+             * top-level zombie windows.                                */
+            if (g_monitorHwnd && IsWindow(g_monitorHwnd)) DestroyWindow(g_monitorHwnd);
+            if (g_resizeCtx && g_resizeCtx->hWnd && IsWindow(g_resizeCtx->hWnd))
+                DestroyWindow(g_resizeCtx->hWnd);
+            if (g_galCtx && g_galCtx->hWnd && IsWindow(g_galCtx->hWnd))
+                DestroyWindow(g_galCtx->hWnd);
+            if (g_emojiCtx && g_emojiCtx->hWnd && IsWindow(g_emojiCtx->hWnd))
+                DestroyWindow(g_emojiCtx->hWnd);
+            /* Wipe the API key from memory before exit. */
+            SecureZeroMemory(g_app.groqApiKey, sizeof(g_app.groqApiKey));
             for (int i = 0; i < g_app.tabCount; ++i) {
                 if (g_app.tabs[i]) {
                     session_destroy(g_app.tabs[i]->session);
@@ -5506,7 +5774,6 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             DeleteObject(g_app.hFontMonoBold);
             DeleteObject(g_app.hFontEmoji);
             DeleteObject(g_app.hFontBig);
-            DeleteCriticalSection(&g_app.lock);
             PostQuitMessage(0);
             return 0;
     }
@@ -5552,6 +5819,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int nShow) {
         NULL, NULL, hInst, NULL);
     if (!hWnd) return 2;
 
+    LOG_INFO(L"Dante CLI %s starting", APP_VERSION_W);
     persist_load();
     if (g_app.tabCount == 0) open_new_tab(L"powershell");
     else g_app.activeTab = 0;
@@ -5559,6 +5827,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int nShow) {
     ShowWindow(hWnd, nShow);
     UpdateWindow(hWnd);
     update_status();
+    LOG_INFO(L"window shown, tabs=%d, scheme=%s", g_app.tabCount,
+             kSchemes[g_schemeIdx].id);
     check_for_updates_async();
 
     MSG msg;

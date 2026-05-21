@@ -23,7 +23,7 @@ echo "Building installer for version ${VERSION}"
         dante_app.c \
         bootstrap.res.o \
         -static -static-libgcc \
-        -lcomctl32 -lshell32 -luser32 -lgdi32 -lkernel32 -lpsapi -lmsimg32 -lole32 -lwinhttp -lwinmm
+        -lcomctl32 -lshell32 -luser32 -lgdi32 -lkernel32 -lpsapi -lmsimg32 -lole32 -lwinhttp -lwinmm -lcrypt32
 )
 echo "  bootstrap built: $(/bin/ls -lh "installer/bootstrap/Dante CLI.exe" | awk '{print $5}')"
 
