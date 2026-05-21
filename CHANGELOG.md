@@ -3,6 +3,29 @@
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 Versionamento [SemVer](https://semver.org/lang/pt-BR/).
 
+## [1.0.36] — 2026-05-20
+
+### Adicionado
+- **Ícones Segoe MDL2 Assets** no header das células do split — fonte vetorial nativa Win10/11. Substituídos os caracteres improvisados (`▢ ▭ ↔` que renderizavam quadrados): agora o close usa `\xE8BB` (ChromeClose), o zoom `\xE740`/`\xE73F` (FullScreen/BackToWindow), o resize `\xE80F` (SizeLegacy), o hamburger `\xE700` (GlobalNavButton). Glyphs limpos, escaláveis e consistentes com o resto do Windows 11.
+- **Tree view real em Pastas** — antes era lista plana. Agora cada pasta tem chevron `▶/▼` (codepoints MDL2 `\xE76C`/`\xE70D`) que expande/colapsa inline. Subpastas ficam indentadas dentro do pai expandido. Mantém o cap de 512 entries totais.
+- **Ícones por tipo de arquivo** no modo Pastas — `icon_for_file()` retorna emoji apropriado por extensão: 🖼 imagens, 📦 zips, 🌐 html, 📕 pdf, 📊 csv/xlsx, 📝 docx, 🎵 áudio, 🎬 vídeo, ⚙ exe/msi, 📄 texto, 📃 outros.
+- **Form multi-campo nativo (`prompt_multi`)** — substitui a cadeia de prompts sequenciais por **um único diálogo** com vários edits ao mesmo tempo:
+  - **Snippet**: Nome / Comando (multiline) / Emoji
+  - **Credencial**: Nome / Tipo / Usuário / Host / Emoji
+  - **Favorito**: Nome / Caminho / Emoji
+  - Enter no campo single-line submete; Esc cancela; Tab navega.
+- **"★ Favoritar esta aba"** no menu de contexto da tab — pega o `cwd` da sessão atual e cria favorito com nome=título e emoji=📂.
+
+### Visual
+- Toolbar inferior com mais espaço (`btnW 110→132`, gap `6→10`, padding interno do botão `34→44` px entre ícone e label).
+- Monitor de Recursos redesenhado — popover maior (580×780), espaços maiores entre seções CPU/Memória, cards de shell com barra colorida vertical em vez de borda inteira, mem em accent + cpu em fg dim, separadores claros.
+
+## [1.0.35] — 2026-05-20
+
+### Corrigido
+- **Erro "Erro ao abrir o arquivo pra gravação" no installer** — agora o NSIS `.onInit` faz `taskkill /F /IM "Dante CLI.exe" /T` antes de copiar arquivos. Se houver uma versão anterior do app rodando, ela é encerrada silenciosamente e a instalação procede. Mesma técnica no `un.onInit` do desinstalador.
+- `SetOverwrite try` adicionado na Section principal: se mesmo assim um arquivo estiver bloqueado (antivírus em scan, etc.), o NSIS retenta automaticamente em vez de abortar.
+
 ## [1.0.34] — 2026-05-20
 
 ### Acessibilidade

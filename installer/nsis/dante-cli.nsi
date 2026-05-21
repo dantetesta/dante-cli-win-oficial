@@ -10,7 +10,7 @@ ManifestSupportedOS all
 ManifestDPIAware true
 
 !define APPNAME            "Dante CLI"
-!define APPVERSION         "1.0.34"
+!define APPVERSION         "1.0.36"
 !define COMPANYNAME        "Dante"
 !define APPEXE             "Dante CLI.exe"
 !define APPID              "DanteCLI"
@@ -31,10 +31,10 @@ RequestExecutionLevel admin
 ShowInstDetails show
 ShowUninstDetails show
 
-VIProductVersion "1.0.34.0"
+VIProductVersion "1.0.36.0"
 VIAddVersionKey "ProductName" "${APPNAME}"
-VIAddVersionKey "FileVersion" "1.0.34.0"
-VIAddVersionKey "ProductVersion" "1.0.34"
+VIAddVersionKey "FileVersion" "1.0.36.0"
+VIAddVersionKey "ProductVersion" "1.0.36"
 VIAddVersionKey "FileDescription" "${APPNAME} installer"
 VIAddVersionKey "LegalCopyright" "(c) ${COMPANYNAME}. MIT License."
 VIAddVersionKey "CompanyName" "${COMPANYNAME}"
@@ -61,15 +61,28 @@ VIAddVersionKey "CompanyName" "${COMPANYNAME}"
 !insertmacro MUI_LANGUAGE "PortugueseBR"
 !insertmacro MUI_LANGUAGE "English"
 
+!macro KillRunningApp
+  ; Silently terminate any running Dante CLI.exe so we can overwrite it.
+  ; nsExec::Exec hides the console window. We don't care about the exit
+  ; code (it's an error when nothing was running — perfectly fine).
+  nsExec::Exec 'taskkill /F /IM "${APPEXE}" /T'
+  Pop $0
+  Sleep 600   ; Give Windows half a second to release the file handle.
+!macroend
+
 Function .onInit
   ${IfNot} ${RunningX64}
     MessageBox MB_ICONSTOP|MB_OK "${APPNAME} requer Windows 10/11 de 64 bits."
     Abort
   ${EndIf}
+  !insertmacro KillRunningApp
 FunctionEnd
 
 Section "Aplicativo principal" SecCore
   SectionIn RO
+  ; If a write still fails (rare — antivirus scan in flight, locked file),
+  ; the user will see a dialog with "Repetir" instead of having to abort.
+  SetOverwrite try
   SetOutPath "$INSTDIR"
   File /r "${DIST_DIR}\*.*"
 
@@ -125,6 +138,13 @@ SectionEnd
 !insertmacro MUI_DESCRIPTION_TEXT ${SecDesktop}   "Cria um atalho na área de trabalho."
 !insertmacro MUI_DESCRIPTION_TEXT ${SecAssoc}     "Reserva associações futuras."
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
+
+Function un.onInit
+  ; Same trick as install — kill any running instance so files can be wiped.
+  nsExec::Exec 'taskkill /F /IM "${APPEXE}" /T'
+  Pop $0
+  Sleep 600
+FunctionEnd
 
 Section "Uninstall"
   Delete "$DESKTOP\${APPNAME}.lnk"

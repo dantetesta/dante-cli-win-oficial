@@ -75,7 +75,7 @@ static PFN_ClosePseudoConsole  pClosePseudoConsole  = NULL;
  *                              CONSTANTS
  * ========================================================================= */
 
-#define APP_VERSION_W   L"1.0.34"
+#define APP_VERSION_W   L"1.0.36"
 #define APP_NAME_W      L"Dante CLI"
 #define APP_WINDOW_CLS  L"DanteCLIMainWindow"
 
@@ -512,6 +512,7 @@ typedef struct {
     HFONT    hFontMonoBold;
     HFONT    hFontEmoji;
     HFONT    hFontBig;
+    HFONT    hFontIcons;    /* Segoe MDL2 Assets — vector glyph set */
     int      cellW;
     int      cellH;
     Tab*     tabs[MAX_TABS];
@@ -568,10 +569,16 @@ typedef struct {
     RECT         sizeBtnRect[MAX_SPLIT_CELLS];      /* resize button rects */
     RECT         unslotBtnRect[MAX_SPLIT_CELLS];    /* "✕" unslot button rects */
     SplitCell    customCells[MAX_SPLIT_CELLS];      /* w==0 → use preset cell */
-    /* Files-mode browser state (sidebar MODE_FILES) */
-    wchar_t      filesDir[MAX_PATH];                /* current folder path */
-    wchar_t      filesEntries[256][MAX_PATH];       /* names of children */
-    BOOL         filesIsDir[256];
+    /* Files-mode browser — flat list that mimics a tree by tracking depth.
+     * Expanding a folder inserts its children inline right after it.    */
+    wchar_t      filesDir[MAX_PATH];     /* root visible folder */
+    struct {
+        wchar_t name[256];
+        wchar_t fullPath[MAX_PATH];
+        BOOL    isDir;
+        BOOL    expanded;
+        int     depth;
+    }            filesEntries[512];
     int          filesCount;
     int          filesScroll;
 } App;
@@ -647,6 +654,8 @@ static void files_set_dir(const wchar_t* path);
 static void files_navigate_up(void);
 static BOOL is_text_file(const wchar_t* path);
 static void show_editor_preview(const wchar_t* path);
+static const wchar_t* icon_for_file(const wchar_t* name);
+static void files_toggle(int idx);
 static const SplitCell* resolve_cell(int idx);
 static void show_resize_popup(int cellIdx, int screenX, int screenY);
 static RECT split_cell_rect(const RECT* parent, const SplitCell* c);
@@ -1864,6 +1873,172 @@ static LRESULT CALLBACK PromptWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
+/* ---- Multi-field prompt ------------------------------------------------
+ * Single modal window with N edit boxes stacked vertically. Each PromptField
+ * exposes its own label / current value / max capacity / multiline flag.
+ * Returns TRUE if user clicked OK, FALSE on Cancel.
+ * ----------------------------------------------------------------------- */
+
+typedef struct {
+    const wchar_t* label;
+    wchar_t*       value;     /* in/out — pre-filled and read back on OK */
+    int            capacity;
+    BOOL           multiline; /* TRUE → bigger box for command bodies */
+} PromptField;
+
+typedef struct {
+    const wchar_t* title;
+    PromptField*   fields;
+    int            fieldCount;
+    HWND           hEdits[8];
+    HWND           hOK, hCancel;
+    BOOL           submitted;
+} PromptMultiCtx;
+
+static PromptMultiCtx* g_promptMultiCtx = NULL;
+static WNDPROC g_origPromptMultiEditProc = NULL;
+
+static LRESULT CALLBACK PromptMultiEditSubclass(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_GETDLGCODE) {
+        /* Multiline edits want Enter to insert newline; single-line ones
+         * should treat Enter as "submit". Read the style to decide.    */
+        LONG style = GetWindowLongPtrW(hWnd, GWL_STYLE);
+        if (!(style & ES_MULTILINE)) return DLGC_WANTALLKEYS;
+    }
+    if (msg == WM_KEYDOWN) {
+        LONG style = GetWindowLongPtrW(hWnd, GWL_STYLE);
+        if (wParam == VK_RETURN && !(style & ES_MULTILINE)) {
+            SendMessageW(GetParent(hWnd), WM_COMMAND, MAKEWPARAM(IDOK, 0), 0);
+            return 0;
+        }
+        if (wParam == VK_ESCAPE) {
+            SendMessageW(GetParent(hWnd), WM_COMMAND, MAKEWPARAM(IDCANCEL, 0), 0);
+            return 0;
+        }
+    }
+    return CallWindowProcW(g_origPromptMultiEditProc, hWnd, msg, wParam, lParam);
+}
+
+static LRESULT CALLBACK PromptMultiWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_CREATE: {
+            HFONT f = g_app.hFontUI;
+            int y = 14;
+            for (int i = 0; i < g_promptMultiCtx->fieldCount; ++i) {
+                PromptField* pf = &g_promptMultiCtx->fields[i];
+                HWND lbl = CreateWindowExW(0, L"STATIC", pf->label,
+                    WS_CHILD | WS_VISIBLE, 18, y, 460, 18,
+                    hWnd, NULL, GetModuleHandleW(NULL), NULL);
+                SendMessageW(lbl, WM_SETFONT, (WPARAM)f, TRUE);
+                y += 22;
+                int eh = pf->multiline ? 96 : 28;
+                DWORD style = WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP;
+                if (pf->multiline) style |= ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL | ES_WANTRETURN;
+                else               style |= ES_AUTOHSCROLL;
+                g_promptMultiCtx->hEdits[i] = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT",
+                    pf->value, style,
+                    18, y, 460, eh,
+                    hWnd, (HMENU)(INT_PTR)(100 + i),
+                    GetModuleHandleW(NULL), NULL);
+                SendMessageW(g_promptMultiCtx->hEdits[i], WM_SETFONT, (WPARAM)f, TRUE);
+                if (i == 0)
+                    g_origPromptMultiEditProc = (WNDPROC)SetWindowLongPtrW(
+                        g_promptMultiCtx->hEdits[i], GWLP_WNDPROC, (LONG_PTR)PromptMultiEditSubclass);
+                else
+                    SetWindowLongPtrW(g_promptMultiCtx->hEdits[i], GWLP_WNDPROC,
+                                      (LONG_PTR)PromptMultiEditSubclass);
+                y += eh + 12;
+            }
+            g_promptMultiCtx->hOK = CreateWindowExW(0, L"BUTTON", L"Salvar",
+                WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_TABSTOP,
+                292, y + 8, 90, 30, hWnd, (HMENU)IDOK,
+                GetModuleHandleW(NULL), NULL);
+            SendMessageW(g_promptMultiCtx->hOK, WM_SETFONT, (WPARAM)f, TRUE);
+            g_promptMultiCtx->hCancel = CreateWindowExW(0, L"BUTTON", L"Cancelar",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                388, y + 8, 90, 30, hWnd, (HMENU)IDCANCEL,
+                GetModuleHandleW(NULL), NULL);
+            SendMessageW(g_promptMultiCtx->hCancel, WM_SETFONT, (WPARAM)f, TRUE);
+            SetFocus(g_promptMultiCtx->hEdits[0]);
+            return 0;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wParam) == IDOK) {
+                for (int i = 0; i < g_promptMultiCtx->fieldCount; ++i) {
+                    GetWindowTextW(g_promptMultiCtx->hEdits[i],
+                                   g_promptMultiCtx->fields[i].value,
+                                   g_promptMultiCtx->fields[i].capacity);
+                }
+                g_promptMultiCtx->submitted = TRUE;
+                DestroyWindow(hWnd);
+            } else if (LOWORD(wParam) == IDCANCEL) {
+                g_promptMultiCtx->submitted = FALSE;
+                DestroyWindow(hWnd);
+            }
+            return 0;
+        case WM_CLOSE:
+            g_promptMultiCtx->submitted = FALSE;
+            DestroyWindow(hWnd);
+            return 0;
+        case WM_DESTROY:
+            PostThreadMessageW(GetCurrentThreadId(), WM_NULL, 0, 0);
+            return 0;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+static BOOL prompt_multi(const wchar_t* title, PromptField* fields, int fieldCount) {
+    static BOOL registered = FALSE;
+    if (!registered) {
+        WNDCLASSEXW wc = { sizeof(wc) };
+        wc.lpfnWndProc = PromptMultiWndProc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = L"DantePromptMulti";
+        RegisterClassExW(&wc);
+        registered = TRUE;
+    }
+
+    PromptMultiCtx ctx = {0};
+    ctx.title = title;
+    ctx.fields = fields;
+    ctx.fieldCount = fieldCount;
+    g_promptMultiCtx = &ctx;
+
+    /* Sum up height needed. */
+    int H = 22;
+    for (int i = 0; i < fieldCount; ++i)
+        H += 22 + (fields[i].multiline ? 96 : 28) + 12;
+    H += 70;
+
+    RECT pr; GetWindowRect(g_app.hWnd, &pr);
+    int W = 520;
+    int x = pr.left + ((pr.right - pr.left) - W) / 2;
+    int y = pr.top  + ((pr.bottom - pr.top) - H) / 2;
+
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        L"DantePromptMulti", title,
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        x, y, W, H, g_app.hWnd, NULL, GetModuleHandleW(NULL), NULL);
+    ShowWindow(dlg, SW_SHOW);
+    EnableWindow(g_app.hWnd, FALSE);
+
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        if (!IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (!IsWindow(dlg)) break;
+    }
+    EnableWindow(g_app.hWnd, TRUE);
+    SetForegroundWindow(g_app.hWnd);
+    BOOL ok = ctx.submitted;
+    g_promptMultiCtx = NULL;
+    return ok;
+}
+
 static BOOL prompt_text(const wchar_t* title, const wchar_t* prompt, wchar_t* out, int outCap) {
     PromptCtx ctx = { title, prompt, out, outCap, NULL, NULL, NULL, FALSE };
     g_promptCtx = &ctx;
@@ -2087,52 +2262,68 @@ static void show_settings_dialog(void) {
 }
 
 static void show_add_dialog(void) {
-    wchar_t name[128]  = {0};
-    wchar_t value[512] = {0};
-
     switch (g_app.sidebarMode) {
         case MODE_FAVORITES: {
-            if (!prompt_text(L"Novo favorito",
-                L"Nome (ex: \"Projeto X\"):", name, 128)) return;
-            if (!prompt_text(L"Novo favorito",
-                L"Caminho da pasta (ex: C:\\Users\\eu\\proj):", value, 512)) return;
+            wchar_t name[128] = {0};
+            wchar_t path[MAX_PATH] = {0};
+            wchar_t emoji[8] = L"\U0001F4C2";
+            PromptField fields[3] = {
+                { L"Nome (ex: \"Projeto X\")",            name,  128,      FALSE },
+                { L"Caminho da pasta (ex: C:\\Users\\eu)", path,  MAX_PATH, FALSE },
+                { L"Emoji",                                emoji, 8,        FALSE },
+            };
+            if (!prompt_multi(L"Novo favorito", fields, 3)) return;
+            if (!name[0] || !path[0]) return;
             if (g_app.favoriteCount >= MAX_FAVORITES) return;
             Favorite* fv = &g_app.favorites[g_app.favoriteCount++];
             memset(fv, 0, sizeof(*fv));
             str_copy_w(fv->name, 128, name);
-            str_copy_w(fv->path, MAX_PATH, value);
-            str_copy_w(fv->emoji, 8, L"\U0001F4C2");
+            str_copy_w(fv->path, MAX_PATH, path);
+            str_copy_w(fv->emoji, 8, emoji[0] ? emoji : L"\U0001F4C2");
             break;
         }
         case MODE_SNIPPETS: {
-            if (!prompt_text(L"Novo snippet",
-                L"Nome (ex: \"Listar containers\"):", name, 128)) return;
-            if (!prompt_text(L"Novo snippet",
-                L"Comando a injetar (ex: docker ps -a):", value, 512)) return;
+            wchar_t name[128] = {0};
+            wchar_t cmd[1024] = {0};
+            wchar_t emoji[8] = L"⚡";
+            PromptField fields[3] = {
+                { L"Nome",                                name,  128,  FALSE },
+                { L"Comando (injetado no terminal ativo)", cmd,   1024, TRUE  },
+                { L"Emoji",                               emoji, 8,    FALSE },
+            };
+            if (!prompt_multi(L"Novo snippet", fields, 3)) return;
+            if (!name[0] || !cmd[0]) return;
             if (g_app.snippetCount >= MAX_SNIPPETS) return;
             Snippet* sn = &g_app.snippets[g_app.snippetCount++];
             memset(sn, 0, sizeof(*sn));
             str_copy_w(sn->name, 128, name);
-            str_copy_w(sn->cmd, 512, value);
-            str_copy_w(sn->emoji, 8, L"⚡");
+            str_copy_w(sn->cmd, 512, cmd);
+            str_copy_w(sn->emoji, 8, emoji[0] ? emoji : L"⚡");
             break;
         }
         case MODE_CREDS: {
-            if (!prompt_text(L"Nova credencial",
-                L"Nome (ex: \"Servidor prod\"):", name, 128)) return;
-            if (!prompt_text(L"Nova credencial",
-                L"Tipo (ssh, ftp, api, custom):", value, 64)) return;
-            wchar_t user[64] = {0}, host[128] = {0};
-            prompt_text(L"Nova credencial", L"Usuário (opcional):", user, 64);
-            prompt_text(L"Nova credencial", L"Host (opcional):", host, 128);
+            wchar_t name[128] = {0};
+            wchar_t kind[16] = L"custom";
+            wchar_t user[64] = {0};
+            wchar_t host[128] = {0};
+            wchar_t emoji[8] = L"\U0001F511";
+            PromptField fields[5] = {
+                { L"Nome (ex: Servidor prod)",            name,  128, FALSE },
+                { L"Tipo (ssh / ftp / api / custom)",     kind,  16,  FALSE },
+                { L"Usuário",                             user,  64,  FALSE },
+                { L"Host",                                host,  128, FALSE },
+                { L"Emoji",                               emoji, 8,   FALSE },
+            };
+            if (!prompt_multi(L"Nova credencial", fields, 5)) return;
+            if (!name[0]) return;
             if (g_app.credCount >= MAX_CREDS) return;
             Credential* c = &g_app.creds[g_app.credCount++];
             memset(c, 0, sizeof(*c));
             str_copy_w(c->name, 128, name);
-            str_copy_w(c->kind, 16, value);
+            str_copy_w(c->kind, 16, kind[0] ? kind : L"custom");
             str_copy_w(c->user, 64, user);
             str_copy_w(c->host, 128, host);
-            str_copy_w(c->emoji, 8, L"\U0001F511");
+            str_copy_w(c->emoji, 8, emoji[0] ? emoji : L"\U0001F511");
             break;
         }
         case MODE_FILES: {
@@ -2165,6 +2356,7 @@ enum {
     IDM_TAB_EMOJI_PICK,
     IDM_TAB_EMOJI_NONE,
     IDM_TAB_APPEARANCE,
+    IDM_TAB_ADD_FAV,
     IDM_TAB_COLOR_BASE   = 0x1200,    /* +0..11 */
     IDM_TAB_SCHEME_BASE  = 0x1300,    /* +0..SCHEME_COUNT-1 */
     IDM_TAB_FONTSIZE_BASE = 0x1400,   /* +9..28 inclusive */
@@ -2434,6 +2626,9 @@ static void show_tab_context_menu(HWND hWnd, int tabIdx, int x, int y) {
     }
 
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, IDM_TAB_ADD_FAV,
+                L"★  Favoritar esta aba (cwd)");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_TAB_NEW_PWSH7, L"Nova aba (PowerShell 7)");
     AppendMenuW(m, MF_STRING, IDM_TAB_NEW_CMD,   L"Nova aba (cmd.exe)");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
@@ -2476,6 +2671,25 @@ static void show_tab_context_menu(HWND hWnd, int tabIdx, int x, int y) {
     } else if (cmd == IDM_TAB_EMOJI_NONE) {
         g_app.tabs[tabIdx]->emoji[0] = 0;
         schedule_persist();
+    } else if (cmd == IDM_TAB_ADD_FAV) {
+        if (g_app.favoriteCount < MAX_FAVORITES) {
+            Tab* t = g_app.tabs[tabIdx];
+            Favorite* fv = &g_app.favorites[g_app.favoriteCount++];
+            memset(fv, 0, sizeof(*fv));
+            str_copy_w(fv->name, 128, t->title);
+            if (t->session && t->session->cwd[0])
+                str_copy_w(fv->path, MAX_PATH, t->session->cwd);
+            else {
+                wchar_t home[MAX_PATH] = {0};
+                SHGetFolderPathW(NULL, CSIDL_PROFILE, NULL, 0, home);
+                str_copy_w(fv->path, MAX_PATH, home);
+            }
+            str_copy_w(fv->emoji, 8, t->emoji[0] ? t->emoji : L"\U0001F4C2");
+            schedule_persist();
+            MessageBoxW(g_app.hWnd,
+                L"Aba favoritada! Confira em ★ Favoritos.",
+                APP_NAME_W, MB_ICONINFORMATION);
+        }
     } else if (cmd >= IDM_TAB_SCHEME_BASE && cmd < IDM_TAB_SCHEME_BASE + SCHEME_COUNT) {
         int idx = cmd - IDM_TAB_SCHEME_BASE;
         str_copy_w(g_app.tabs[tabIdx]->customScheme, 32, kSchemes[idx].id);
@@ -2732,8 +2946,8 @@ static void fmt_bytes(SIZE_T bytes, wchar_t* out, size_t cap) {
 
 /* ---- Popover window -------------------------------------------------- */
 
-#define MON_W   540
-#define MON_H   720
+#define MON_W   580
+#define MON_H   780
 
 static HWND g_monitorHwnd = NULL;
 
@@ -2743,32 +2957,25 @@ static void monitor_paint(HDC dc, RECT cli) {
     FillRect(dc, &cli, bg);
     DeleteObject(bg);
 
-    int x = 22, y = 18;
+    int x = 26, y = 22;
 
     /* Header */
     draw_text_w(dc, x, y, L"\U0001F4CA  Consumo de Recursos",
                 COL_FG, g_app.hFontBig);
-    SIZE titleSz;
-    HFONT oldF = (HFONT)SelectObject(dc, g_app.hFontBig);
-    GetTextExtentPoint32W(dc, L"\U0001F4CA  Consumo de Recursos",
-                          22, &titleSz);
-    SelectObject(dc, oldF);
-    draw_text_w(dc, MON_W - 150, y + 8, L"Atualiza a cada 1s",
+    draw_text_w(dc, MON_W - 150, y + 12, L"Atualiza a cada 1s",
                 COL_FG_DIM, g_app.hFontUI);
-
-    y += titleSz.cy + 12;
+    y += 46;
 
     HPEN pen = CreatePen(PS_SOLID, 1, COL_DIV);
     HGDIOBJ op = SelectObject(dc, pen);
-    MoveToEx(dc, 16, y, NULL);
-    LineTo(dc, MON_W - 16, y);
+    MoveToEx(dc, 18, y, NULL);
+    LineTo(dc, MON_W - 18, y);
     SelectObject(dc, op);
     DeleteObject(pen);
+    y += 24;
 
-    y += 18;
-
-    /* CPU */
-    draw_text_w(dc, x, y, L"⊙  CPU", COL_FG, g_app.hFontUIBold);
+    /* ─── CPU section ─────────────────────────────────────────── */
+    draw_text_w(dc, x, y + 6, L"○  CPU", COL_FG, g_app.hFontUIBold);
     wchar_t cpuStr[32];
     _snwprintf_s(cpuStr, 32, _TRUNCATE, L"%.1f%%", g_lastTotalCpu);
     HFONT oldB = (HFONT)SelectObject(dc, g_app.hFontBig);
@@ -2778,13 +2985,13 @@ static void monitor_paint(HDC dc, RECT cli) {
     SetTextColor(dc, g_lastTotalCpu > 80 ? COL_RED
                   : g_lastTotalCpu > 40 ? COL_ORANGE
                   : COL_GREEN);
-    TextOutW(dc, MON_W - cpuSz.cx - 22, y - 4, cpuStr, (int)wcslen(cpuStr));
+    TextOutW(dc, MON_W - cpuSz.cx - 26, y, cpuStr, (int)wcslen(cpuStr));
     SelectObject(dc, oldB);
-    y += 26;
+    y += 38;
 
     /* Sparkline */
-    RECT spark = { x, y, MON_W - 22, y + 70 };
-    fill_rect_color(dc, &spark, RGB(0x10, 0x10, 0x18));
+    RECT spark = { x, y, MON_W - 26, y + 80 };
+    draw_rounded_rect(dc, spark, RGB(0x10, 0x10, 0x18), 0, 8);
     HPEN linePen = CreatePen(PS_SOLID, 2, COL_GREEN);
     HGDIOBJ olp = SelectObject(dc, linePen);
     int sparkW = spark.right - spark.left;
@@ -2793,91 +3000,92 @@ static void monitor_paint(HDC dc, RECT cli) {
     for (int i = 0; i < CPU_HIST_LEN; ++i) {
         int slot = (g_cpuHistIdx + i) % CPU_HIST_LEN;
         double v = g_cpuHist[slot] / 100.0;
-        int px = spark.left + (sparkW * i) / (CPU_HIST_LEN - 1);
-        int py = spark.bottom - (int)(sparkH * v) - 1;
-        if (prevX >= 0) {
-            MoveToEx(dc, prevX, prevY, NULL);
-            LineTo(dc, px, py);
-        }
+        int px = spark.left + 4 + ((sparkW - 8) * i) / (CPU_HIST_LEN - 1);
+        int py = spark.bottom - (int)((sparkH - 8) * v) - 4;
+        if (prevX >= 0) { MoveToEx(dc, prevX, prevY, NULL); LineTo(dc, px, py); }
         prevX = px; prevY = py;
     }
     SelectObject(dc, olp);
     DeleteObject(linePen);
-    y += 78;
+    y += 90;
 
     draw_text_w(dc, x, y,
-                L"100% = 1 núcleo. Topo do gráfico = todos os núcleos saturados.",
+                L"100% = 1 núcleo. Topo do gráfico = todos saturados.",
                 COL_FG_DIM, g_app.hFontUI);
-    y += 26;
+    y += 36;
 
-    /* Memory */
-    draw_text_w(dc, x, y, L"\U0001F4BE  Memória", COL_FG, g_app.hFontUIBold);
+    /* ─── Memory section ──────────────────────────────────────── */
+    draw_text_w(dc, x, y + 6, L"■  Memória", COL_FG, g_app.hFontUIBold);
     wchar_t memStr[32];
     fmt_bytes(g_lastTotalMem, memStr, 32);
     oldB = (HFONT)SelectObject(dc, g_app.hFontBig);
     SIZE memSz;
     GetTextExtentPoint32W(dc, memStr, (int)wcslen(memStr), &memSz);
     SetTextColor(dc, COL_RED);
-    TextOutW(dc, MON_W - memSz.cx - 22, y - 4, memStr, (int)wcslen(memStr));
+    TextOutW(dc, MON_W - memSz.cx - 26, y, memStr, (int)wcslen(memStr));
     SelectObject(dc, oldB);
-    y += 26;
+    y += 38;
 
-    /* Memory bar: App in blue, Shells in magenta */
-    RECT mbar = { x, y, MON_W - 22, y + 18 };
-    fill_rect_color(dc, &mbar, RGB(0x10, 0x10, 0x18));
+    /* Memory bar */
+    RECT mbar = { x, y, MON_W - 26, y + 22 };
+    draw_rounded_rect(dc, mbar, RGB(0x10, 0x10, 0x18), 0, 6);
     if (g_lastTotalMem > 0) {
         double appFrac   = (double)g_lastAppMem   / (double)g_lastTotalMem;
         double shellFrac = (double)g_lastShellMem / (double)g_lastTotalMem;
-        int barW = mbar.right - mbar.left;
+        int barW = mbar.right - mbar.left - 4;
         int appW   = (int)(barW * appFrac);
         int shellW = (int)(barW * shellFrac);
-        RECT a = { mbar.left, mbar.top, mbar.left + appW, mbar.bottom };
-        RECT s = { a.right,    mbar.top, a.right + shellW, mbar.bottom };
-        fill_rect_color(dc, &a, COL_ACCENT);
-        fill_rect_color(dc, &s, COL_MAGENTA);
+        RECT a = { mbar.left + 2,  mbar.top + 2, mbar.left + 2 + appW, mbar.bottom - 2 };
+        RECT s = { a.right,        mbar.top + 2, a.right + shellW,     mbar.bottom - 2 };
+        HBRUSH bA = CreateSolidBrush(COL_ACCENT);
+        HBRUSH bS = CreateSolidBrush(COL_MAGENTA);
+        FillRect(dc, &a, bA);
+        FillRect(dc, &s, bS);
+        DeleteObject(bA); DeleteObject(bS);
     }
-    y += 26;
+    y += 36;
 
     /* Legend */
     wchar_t appLbl[32], shLbl[32];
-    fmt_bytes(g_lastAppMem,  appLbl, 32);
+    fmt_bytes(g_lastAppMem,   appLbl, 32);
     fmt_bytes(g_lastShellMem, shLbl, 32);
+
     HBRUSH dotA = CreateSolidBrush(COL_ACCENT);
-    RECT da = { x, y + 5, x + 10, y + 15 };
+    RECT da = { x, y + 6, x + 12, y + 18 };
     FillRect(dc, &da, dotA);
     DeleteObject(dotA);
     wchar_t legA[64];
-    _snwprintf_s(legA, 64, _TRUNCATE, L"App  %s", appLbl);
-    draw_text_w(dc, x + 16, y + 2, legA, COL_FG, g_app.hFontUI);
+    _snwprintf_s(legA, 64, _TRUNCATE, L"App   %s", appLbl);
+    draw_text_w(dc, x + 20, y + 3, legA, COL_FG, g_app.hFontUI);
 
     HBRUSH dotS = CreateSolidBrush(COL_MAGENTA);
-    RECT ds = { x + 160, y + 5, x + 170, y + 15 };
+    RECT ds = { x + 190, y + 6, x + 202, y + 18 };
     FillRect(dc, &ds, dotS);
     DeleteObject(dotS);
     wchar_t legS[64];
-    _snwprintf_s(legS, 64, _TRUNCATE, L"Shells  %s", shLbl);
-    draw_text_w(dc, x + 176, y + 2, legS, COL_FG, g_app.hFontUI);
-    y += 28;
+    _snwprintf_s(legS, 64, _TRUNCATE, L"Shells   %s", shLbl);
+    draw_text_w(dc, x + 210, y + 3, legS, COL_FG, g_app.hFontUI);
+    y += 30;
 
     draw_text_w(dc, x, y,
-                L"App = processo Dante CLI. Shells = soma de cada terminal +",
+                L"App = processo Dante CLI. Shells = soma das sessões",
                 COL_FG_DIM, g_app.hFontUI);
     draw_text_w(dc, x, y + 16,
-                L"processos filhos (npm, node, git, etc.).",
+                L"e seus processos filhos (npm, node, git, etc.).",
                 COL_FG_DIM, g_app.hFontUI);
-    y += 38;
+    y += 46;
 
     /* Divider */
     HPEN p2 = CreatePen(PS_SOLID, 1, COL_DIV);
     HGDIOBJ op2 = SelectObject(dc, p2);
-    MoveToEx(dc, 16, y, NULL);
-    LineTo(dc, MON_W - 16, y);
+    MoveToEx(dc, 18, y, NULL);
+    LineTo(dc, MON_W - 18, y);
     SelectObject(dc, op2);
     DeleteObject(p2);
-    y += 18;
+    y += 24;
 
     /* Tabs header */
-    draw_text_w(dc, x, y, L"\U0001F4BB  Terminais ativos",
+    draw_text_w(dc, x, y, L"■  Terminais ativos",
                 COL_FG, g_app.hFontUIBold);
     wchar_t cnt[32];
     _snwprintf_s(cnt, 32, _TRUNCATE, L"%d shell(s)", g_app.tabCount);
@@ -2885,45 +3093,52 @@ static void monitor_paint(HDC dc, RECT cli) {
     HFONT oldU = (HFONT)SelectObject(dc, g_app.hFontUI);
     GetTextExtentPoint32W(dc, cnt, (int)wcslen(cnt), &cs);
     SetTextColor(dc, COL_FG_DIM);
-    TextOutW(dc, MON_W - cs.cx - 22, y + 2, cnt, (int)wcslen(cnt));
+    TextOutW(dc, MON_W - cs.cx - 26, y + 2, cnt, (int)wcslen(cnt));
     SelectObject(dc, oldU);
-    y += 26;
+    y += 30;
 
-    /* Tab cards — 2 columns */
-    int cardW = (MON_W - 22 - 22 - 12) / 2;
-    int cardH = 56;
+    /* Tab cards — 2 columns, taller and roomier */
+    int cardW = (MON_W - 26 - 26 - 14) / 2;
+    int cardH = 68;
     for (int i = 0; i < g_app.tabCount && y + cardH < cli.bottom - 12; ++i) {
         Tab* t = g_app.tabs[i];
         if (!t) continue;
         int col = i % 2;
         int row = i / 2;
         RECT card;
-        card.left  = x + col * (cardW + 12);
-        card.top   = y + row * (cardH + 8);
+        card.left  = x + col * (cardW + 14);
+        card.top   = y + row * (cardH + 10);
         card.right = card.left + cardW;
         card.bottom= card.top + cardH;
-        if (card.bottom >= cli.bottom - 8) break;
+        if (card.bottom >= cli.bottom - 12) break;
 
         COLORREF acc = (t->colorIdx >= 0) ? kTabColors[t->colorIdx] : COL_ACCENT;
-        draw_rounded_rect(dc, card, COL_BG_CHIP, mix_color(acc, RGB(0,0,0), 0.40), 8);
+        /* Slight color tint via a leading vertical bar — much cleaner
+         * than a full border that competes with the dark background.  */
+        draw_rounded_rect(dc, card, COL_BG_CHIP, mix_color(acc, RGB(0,0,0), 0.30), 10);
+        RECT colorBar = { card.left, card.top + 8,
+                          card.left + 4, card.bottom - 8 };
+        fill_rect_color(dc, &colorBar, acc);
 
         if (t->emoji[0])
-            draw_text_w(dc, card.left + 10, card.top + 6,
+            draw_text_w(dc, card.left + 16, card.top + 12,
                         t->emoji, COL_FG, g_app.hFontEmoji);
         wchar_t name[64];
         size_t nl = wcslen(t->title);
-        if (nl > 18) { wcsncpy_s(name, 64, t->title, 17); name[17] = L'…'; name[18] = 0; }
+        if (nl > 22) { wcsncpy_s(name, 64, t->title, 21); name[21] = L'…'; name[22] = 0; }
         else         wcscpy_s(name, 64, t->title);
-        draw_text_w(dc, card.left + 38, card.top + 6,
+        draw_text_w(dc, card.left + 44, card.top + 12,
                     name, COL_FG, g_app.hFontUIBold);
 
-        wchar_t info[64];
+        /* mem + cpu chips, separated for readability */
         wchar_t memBuf[16];
         fmt_bytes(t->cachedMemBytes, memBuf, 16);
-        _snwprintf_s(info, 64, _TRUNCATE, L"%s  ·  %.0f%%",
-                     memBuf, t->cachedCpuPct);
-        draw_text_w(dc, card.left + 38, card.top + 28,
-                    info, COL_FG_DIM, g_app.hFontUI);
+        draw_text_w(dc, card.left + 44, card.top + 38,
+                    memBuf, COL_ACCENT, g_app.hFontUI);
+        wchar_t cpuBuf[16];
+        _snwprintf_s(cpuBuf, 16, _TRUNCATE, L"%.0f%% CPU", t->cachedCpuPct);
+        draw_text_w(dc, card.left + 44 + 64, card.top + 38,
+                    cpuBuf, COL_FG_DIM, g_app.hFontUI);
     }
 }
 
@@ -5084,23 +5299,48 @@ static void draw_sidebar(HDC dc, const RECT* rc) {
         SetBkMode(dc, TRANSPARENT);
         int rowH = 28;
         for (int i = 0; i < itemCount && y + rowH < rc->bottom - 48; ++i) {
+            int depth = g_app.filesEntries[i].depth;
+            int indent = depth * 14;
             RECT row = { rc->left + 12, y, rc->right - 12, y + rowH - 2 };
             BOOL hover = (g_app.sidebarItemHoverIdx == i);
             draw_rounded_rect(dc, row, hover ? COL_BG_CHIP_H : COL_BG_CHIP, 0, 6);
-            const wchar_t* icon = (i == 0) ? L"↰" :
-                                  g_app.filesIsDir[i] ? L"\U0001F4C1" : L"\U0001F4C4";
-            draw_text_w(dc, row.left + 8, row.top + 3,
-                        icon, COL_FG, g_app.hFontEmoji);
-            wchar_t shown[48];
-            size_t nl = wcslen(g_app.filesEntries[i]);
-            if (nl > 30) {
-                wcsncpy_s(shown, 48, g_app.filesEntries[i], 29);
-                shown[29] = L'…'; shown[30] = 0;
+
+            /* Toggle chevron for directories. */
+            int xCur = row.left + 8 + indent;
+            if (g_app.filesEntries[i].isDir) {
+                HFONT oldI = (HFONT)SelectObject(dc, g_app.hFontIcons);
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, COL_FG_DIM);
+                /* E76C ChevronRight, E70D ChevronDown */
+                const wchar_t* chev = g_app.filesEntries[i].expanded ? L"\xE70D" : L"\xE76C";
+                TextOutW(dc, xCur, row.top + 4, chev, 1);
+                SelectObject(dc, oldI);
+                xCur += 16;
             } else {
-                wcscpy_s(shown, 48, g_app.filesEntries[i]);
+                xCur += 16;
             }
-            draw_text_w(dc, row.left + 36, row.top + 5,
-                        shown, g_app.filesIsDir[i] ? COL_FG : COL_FG_DIM,
+
+            /* Icon */
+            const wchar_t* icon = g_app.filesEntries[i].isDir
+                ? L"\U0001F4C1"
+                : icon_for_file(g_app.filesEntries[i].name);
+            draw_text_w(dc, xCur, row.top + 3, icon, COL_FG, g_app.hFontEmoji);
+            xCur += 24;
+
+            wchar_t shown[48];
+            const wchar_t* nm = g_app.filesEntries[i].name;
+            size_t nl = wcslen(nm);
+            int maxLen = 30 - depth * 2;
+            if (maxLen < 8) maxLen = 8;
+            if ((int)nl > maxLen) {
+                wcsncpy_s(shown, 48, nm, maxLen - 1);
+                shown[maxLen - 1] = L'…';
+                shown[maxLen] = 0;
+            } else {
+                wcscpy_s(shown, 48, nm);
+            }
+            draw_text_w(dc, xCur, row.top + 5,
+                        shown, g_app.filesEntries[i].isDir ? COL_FG : COL_FG_DIM,
                         g_app.hFontUI);
             y += rowH;
         }
@@ -5355,17 +5595,14 @@ static void draw_terminal_header(HDC dc, RECT hdr, Tab* t, BOOL hasFocus, int ce
 
     fill_rect_color(dc, &hdr, acc);
 
-    /* Hamburger icon — 3 lines on the left. */
-    HPEN pen = CreatePen(PS_SOLID, 2, fg);
-    HGDIOBJ op = SelectObject(dc, pen);
-    int hx = hdr.left + 14;
-    int hy = hdr.top  + 12;
-    for (int i = 0; i < 3; ++i) {
-        MoveToEx(dc, hx, hy + i * 6, NULL);
-        LineTo(dc, hx + 16, hy + i * 6);
+    /* Hamburger icon (Segoe MDL2 GlobalNavButton = U+E700). */
+    {
+        HFONT old = (HFONT)SelectObject(dc, g_app.hFontIcons);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, fg);
+        TextOutW(dc, hdr.left + 14, hdr.top + 11, L"\xE700", 1);
+        SelectObject(dc, old);
     }
-    SelectObject(dc, op);
-    DeleteObject(pen);
 
     int x = hdr.left + 44;
 
@@ -5402,64 +5639,60 @@ static void draw_terminal_header(HDC dc, RECT hdr, Tab* t, BOOL hasFocus, int ce
      * ⤢ zoom (split only). Each stores its hit rect for the global handler. */
     int rightCursor = hdr.right - 10;
 
-    /* Unslot button — removes the tab from this slot without closing it.
-     * The slot becomes empty (placeholder). The Tab stays alive elsewhere. */
+    /* All three header buttons use Segoe MDL2 Assets icons (Win10/11 native).
+     * Codepoints: E8BB ChromeClose, E740 FullScreen, E73F BackToWindow,
+     * E80F SizeLegacy.                                                  */
     if (g_app.splitLayout != PRESET_SINGLE && cellIdx >= 0 && cellIdx < MAX_SPLIT_CELLS) {
-        RECT btn = { rightCursor - 28, hdr.top + 6, rightCursor, hdr.bottom - 6 };
-        COLORREF btnBg = mix_color(acc, RGB(0,0,0), 0.35);
-        draw_rounded_rect(dc, btn, btnBg, 0, 8);
-        SIZE sz;
-        HFONT old = (HFONT)SelectObject(dc, g_app.hFontUIBold);
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, fg);
-        GetTextExtentPoint32W(dc, L"✕", 1, &sz);
-        TextOutW(dc, btn.left + ((btn.right - btn.left) - sz.cx) / 2,
-                 btn.top  + ((btn.bottom - btn.top) - sz.cy) / 2,
-                 L"✕", 1);
-        SelectObject(dc, old);
-        g_app.unslotBtnRect[cellIdx] = btn;
-        rightCursor = btn.left - 6;
-    }
-
-    /* Zoom button */
-    if (g_app.splitLayout != PRESET_SINGLE && cellIdx >= 0 && cellIdx < MAX_SPLIT_CELLS) {
-        RECT btn = { rightCursor - 28, hdr.top + 6, rightCursor, hdr.bottom - 6 };
-        BOOL isZoomed = (g_app.zoomedCell == cellIdx);
-        COLORREF btnBg = mix_color(acc, RGB(0,0,0), isZoomed ? 0.55 : 0.35);
-        draw_rounded_rect(dc, btn, btnBg, 0, 8);
-        /* Use simple geometric glyphs that always render on Segoe UI. */
-        const wchar_t* icon = isZoomed ? L"▭" : L"▢";
-        SIZE sz;
-        HFONT old = (HFONT)SelectObject(dc, g_app.hFontEmoji);
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, fg);
-        GetTextExtentPoint32W(dc, icon, (int)wcslen(icon), &sz);
-        TextOutW(dc, btn.left + ((btn.right - btn.left) - sz.cx) / 2,
-                 btn.top  + ((btn.bottom - btn.top) - sz.cy) / 2,
-                 icon, (int)wcslen(icon));
-        SelectObject(dc, old);
-        g_app.zoomBtnRect[cellIdx] = btn;
-        rightCursor = btn.left - 6;
-    }
-
-    /* Resize button (↔) */
-    if (g_app.splitLayout != PRESET_SINGLE && cellIdx >= 0 && cellIdx < MAX_SPLIT_CELLS) {
-        RECT btn = { rightCursor - 28, hdr.top + 6, rightCursor, hdr.bottom - 6 };
-        COLORREF btnBg = mix_color(acc, RGB(0,0,0), 0.35);
-        draw_rounded_rect(dc, btn, btnBg, 0, 8);
-        /* "↔" reads as "resize" universally, renders cleanly on Segoe UI.  */
-        const wchar_t* icon = L"↔";
-        SIZE sz;
-        HFONT old = (HFONT)SelectObject(dc, g_app.hFontEmoji);
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, fg);
-        GetTextExtentPoint32W(dc, icon, (int)wcslen(icon), &sz);
-        TextOutW(dc, btn.left + ((btn.right - btn.left) - sz.cx) / 2,
-                 btn.top  + ((btn.bottom - btn.top) - sz.cy) / 2,
-                 icon, (int)wcslen(icon));
-        SelectObject(dc, old);
-        g_app.sizeBtnRect[cellIdx] = btn;
-        rightCursor = btn.left - 6;
+        /* Unslot button (✕ - removes terminal from slot, keeps tab alive). */
+        {
+            RECT btn = { rightCursor - 28, hdr.top + 6, rightCursor, hdr.bottom - 6 };
+            COLORREF btnBg = mix_color(acc, RGB(0,0,0), 0.35);
+            draw_rounded_rect(dc, btn, btnBg, 0, 8);
+            HFONT old = (HFONT)SelectObject(dc, g_app.hFontIcons);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, fg);
+            SIZE sz; GetTextExtentPoint32W(dc, L"\xE8BB", 1, &sz);
+            TextOutW(dc, btn.left + ((btn.right - btn.left) - sz.cx) / 2,
+                     btn.top  + ((btn.bottom - btn.top) - sz.cy) / 2,
+                     L"\xE8BB", 1);
+            SelectObject(dc, old);
+            g_app.unslotBtnRect[cellIdx] = btn;
+            rightCursor = btn.left - 6;
+        }
+        /* Zoom button (full-screen / back-to-window). */
+        {
+            RECT btn = { rightCursor - 28, hdr.top + 6, rightCursor, hdr.bottom - 6 };
+            BOOL isZoomed = (g_app.zoomedCell == cellIdx);
+            COLORREF btnBg = mix_color(acc, RGB(0,0,0), isZoomed ? 0.55 : 0.35);
+            draw_rounded_rect(dc, btn, btnBg, 0, 8);
+            const wchar_t* icon = isZoomed ? L"\xE73F" : L"\xE740";
+            HFONT old = (HFONT)SelectObject(dc, g_app.hFontIcons);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, fg);
+            SIZE sz; GetTextExtentPoint32W(dc, icon, 1, &sz);
+            TextOutW(dc, btn.left + ((btn.right - btn.left) - sz.cx) / 2,
+                     btn.top  + ((btn.bottom - btn.top) - sz.cy) / 2,
+                     icon, 1);
+            SelectObject(dc, old);
+            g_app.zoomBtnRect[cellIdx] = btn;
+            rightCursor = btn.left - 6;
+        }
+        /* Resize button (SizeLegacy U+E80F). */
+        {
+            RECT btn = { rightCursor - 28, hdr.top + 6, rightCursor, hdr.bottom - 6 };
+            COLORREF btnBg = mix_color(acc, RGB(0,0,0), 0.35);
+            draw_rounded_rect(dc, btn, btnBg, 0, 8);
+            HFONT old = (HFONT)SelectObject(dc, g_app.hFontIcons);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, fg);
+            SIZE sz; GetTextExtentPoint32W(dc, L"\xE80F", 1, &sz);
+            TextOutW(dc, btn.left + ((btn.right - btn.left) - sz.cx) / 2,
+                     btn.top  + ((btn.bottom - btn.top) - sz.cy) / 2,
+                     L"\xE80F", 1);
+            SelectObject(dc, old);
+            g_app.sizeBtnRect[cellIdx] = btn;
+            rightCursor = btn.left - 6;
+        }
     }
 
     int zoomBtnRight = rightCursor;
@@ -5749,9 +5982,9 @@ static const ToolbarAction kToolbarActions[] = {
 #define TOOLBAR_ACTION_COUNT (sizeof(kToolbarActions)/sizeof(kToolbarActions[0]))
 
 static void toolbar_action_rect(int idx, const RECT* rc, RECT* out) {
-    int btnW = 110;
-    int gap = 6;
-    int x = rc->left + 10 + idx * (btnW + gap);
+    int btnW = 132;
+    int gap = 10;
+    int x = rc->left + 14 + idx * (btnW + gap);
     out->left = x; out->right = x + btnW;
     out->top = rc->top + 4; out->bottom = rc->bottom - 4;
 }
@@ -5799,7 +6032,7 @@ static void draw_toolbar(HDC dc, const RECT* rc) {
         } else {
             wcscpy_s(label, 64, kToolbarActions[i].label);
         }
-        TextOutW(dc, br.left + 34, br.top + 7, label, (int)wcslen(label));
+        TextOutW(dc, br.left + 44, br.top + 7, label, (int)wcslen(label));
         SelectObject(dc, old);
     }
 }
@@ -6200,59 +6433,160 @@ static int hit_test_sidebar_add(int x, int y, const RECT* rc) {
 
 /* --------- Files mode: list/refresh/navigate the filesystem -------- */
 
-static int wstr_cmp_ci(const void* a, const void* b) {
-    return _wcsicmp((const wchar_t*)a, (const wchar_t*)b);
+/* Choose an emoji glyph for a given file by extension. Returns a static
+ * NUL-terminated wide string suitable for TextOutW.                     */
+static const wchar_t* icon_for_file(const wchar_t* name) {
+    const wchar_t* dot = wcsrchr(name, L'.');
+    if (!dot) return L"\U0001F4C4";   /* generic file */
+    if (!_wcsicmp(dot, L".png")  || !_wcsicmp(dot, L".jpg")  ||
+        !_wcsicmp(dot, L".jpeg") || !_wcsicmp(dot, L".gif")  ||
+        !_wcsicmp(dot, L".webp") || !_wcsicmp(dot, L".bmp")  ||
+        !_wcsicmp(dot, L".svg")  || !_wcsicmp(dot, L".heic"))
+        return L"\U0001F5BC";        /* 🖼 */
+    if (!_wcsicmp(dot, L".zip")  || !_wcsicmp(dot, L".rar")  ||
+        !_wcsicmp(dot, L".7z")   || !_wcsicmp(dot, L".tar")  ||
+        !_wcsicmp(dot, L".gz")   || !_wcsicmp(dot, L".dmg")  ||
+        !_wcsicmp(dot, L".iso")  || !_wcsicmp(dot, L".bz2"))
+        return L"\U0001F4E6";        /* 📦 */
+    if (!_wcsicmp(dot, L".html") || !_wcsicmp(dot, L".htm"))
+        return L"\U0001F310";        /* 🌐 */
+    if (!_wcsicmp(dot, L".pdf"))
+        return L"\U0001F4D5";        /* 📕 */
+    if (!_wcsicmp(dot, L".xlsx") || !_wcsicmp(dot, L".xls")  ||
+        !_wcsicmp(dot, L".csv")  || !_wcsicmp(dot, L".tsv"))
+        return L"\U0001F4CA";        /* 📊 */
+    if (!_wcsicmp(dot, L".docx") || !_wcsicmp(dot, L".doc"))
+        return L"\U0001F4DD";        /* 📝 */
+    if (!_wcsicmp(dot, L".mp3")  || !_wcsicmp(dot, L".wav")  ||
+        !_wcsicmp(dot, L".ogg")  || !_wcsicmp(dot, L".m4a")  ||
+        !_wcsicmp(dot, L".flac"))
+        return L"\U0001F3B5";        /* 🎵 */
+    if (!_wcsicmp(dot, L".mp4")  || !_wcsicmp(dot, L".mov")  ||
+        !_wcsicmp(dot, L".avi")  || !_wcsicmp(dot, L".mkv")  ||
+        !_wcsicmp(dot, L".webm"))
+        return L"\U0001F3AC";        /* 🎬 */
+    if (!_wcsicmp(dot, L".exe")  || !_wcsicmp(dot, L".msi")  ||
+        !_wcsicmp(dot, L".bat")  || !_wcsicmp(dot, L".cmd"))
+        return L"⚙";
+    if (is_text_file(name))
+        return L"\U0001F4C4";        /* 📄 plain text-ish */
+    return L"\U0001F4C3";            /* 📃 generic */
+}
+
+/* qsort helper: directories first, then case-insensitive name. */
+typedef struct { wchar_t name[256]; BOOL isDir; } FilesSortItem;
+static int files_sort_cmp(const void* a, const void* b) {
+    const FilesSortItem* x = (const FilesSortItem*)a;
+    const FilesSortItem* y = (const FilesSortItem*)b;
+    if (x->isDir != y->isDir) return x->isDir ? -1 : 1;
+    return _wcsicmp(x->name, y->name);
 }
 
 static void files_set_dir(const wchar_t* path);
 
-static void files_refresh(void) {
-    g_app.filesCount = 0;
-    g_app.filesScroll = 0;
-
-    if (!g_app.filesDir[0]) {
-        /* First open — default to user home */
-        SHGetFolderPathW(NULL, CSIDL_PROFILE, NULL, 0, g_app.filesDir);
-    }
-
+/* Enumerate `dir` into the slot starting at `at`, depth = `depth`. Returns
+ * the number of entries inserted. Sorts directories first.              */
+static int files_list_into(int at, int depth, const wchar_t* dir) {
     wchar_t pattern[MAX_PATH];
-    _snwprintf_s(pattern, MAX_PATH, _TRUNCATE, L"%s\\*", g_app.filesDir);
+    _snwprintf_s(pattern, MAX_PATH, _TRUNCATE, L"%s\\*", dir);
 
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileW(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
+    if (h == INVALID_HANDLE_VALUE) return 0;
 
-    /* Slot 0 reserved for ".." parent navigation. */
-    wcscpy_s(g_app.filesEntries[g_app.filesCount], MAX_PATH, L"..");
-    g_app.filesIsDir[g_app.filesCount] = TRUE;
-    g_app.filesCount++;
-
+    /* First gather + sort, then commit. */
+    FilesSortItem buf[256];
+    int n = 0;
     do {
         if (wcscmp(fd.cFileName, L".")  == 0) continue;
         if (wcscmp(fd.cFileName, L"..") == 0) continue;
-        if (g_app.filesCount >= 256) break;
-        wcscpy_s(g_app.filesEntries[g_app.filesCount], MAX_PATH, fd.cFileName);
-        g_app.filesIsDir[g_app.filesCount] =
-            (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-        g_app.filesCount++;
+        if (n >= 256) break;
+        wcscpy_s(buf[n].name, 256, fd.cFileName);
+        buf[n].isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        n++;
     } while (FindNextFileW(h, &fd));
     FindClose(h);
 
-    /* Sort entries [1..count] case-insensitive (slot 0 stays ".."). */
-    if (g_app.filesCount > 2) {
-        qsort(g_app.filesEntries[1],
-              g_app.filesCount - 1,
-              MAX_PATH * sizeof(wchar_t),
-              wstr_cmp_ci);
-        /* Re-derive isDir flags after sort: re-stat each entry. */
-        for (int i = 1; i < g_app.filesCount; ++i) {
-            wchar_t full[MAX_PATH];
-            _snwprintf_s(full, MAX_PATH, _TRUNCATE, L"%s\\%s",
-                         g_app.filesDir, g_app.filesEntries[i]);
-            DWORD a = GetFileAttributesW(full);
-            g_app.filesIsDir[i] = (a != INVALID_FILE_ATTRIBUTES) &&
-                                  (a & FILE_ATTRIBUTE_DIRECTORY);
+    qsort(buf, n, sizeof(FilesSortItem), files_sort_cmp);
+
+    int inserted = 0;
+    for (int i = 0; i < n && at + inserted < 512; ++i) {
+        int slot = at + inserted;
+        wcscpy_s(g_app.filesEntries[slot].name, 256, buf[i].name);
+        _snwprintf_s(g_app.filesEntries[slot].fullPath, MAX_PATH, _TRUNCATE,
+                     L"%s\\%s", dir, buf[i].name);
+        g_app.filesEntries[slot].isDir = buf[i].isDir;
+        g_app.filesEntries[slot].expanded = FALSE;
+        g_app.filesEntries[slot].depth = depth;
+        inserted++;
+    }
+    return inserted;
+}
+
+static void files_refresh(void) {
+    g_app.filesCount = 0;
+    g_app.filesScroll = 0;
+    if (!g_app.filesDir[0]) {
+        SHGetFolderPathW(NULL, CSIDL_PROFILE, NULL, 0, g_app.filesDir);
+    }
+    g_app.filesCount = files_list_into(0, 0, g_app.filesDir);
+}
+
+static void files_toggle(int idx) {
+    if (idx < 0 || idx >= g_app.filesCount) return;
+    if (!g_app.filesEntries[idx].isDir) return;
+
+    if (g_app.filesEntries[idx].expanded) {
+        /* Collapse — drop every entry below with greater depth. */
+        int d = g_app.filesEntries[idx].depth;
+        int end = idx + 1;
+        while (end < g_app.filesCount && g_app.filesEntries[end].depth > d) ++end;
+        int removed = end - idx - 1;
+        if (removed > 0) {
+            for (int i = end; i < g_app.filesCount; ++i)
+                g_app.filesEntries[i - removed] = g_app.filesEntries[i];
+            g_app.filesCount -= removed;
         }
+        g_app.filesEntries[idx].expanded = FALSE;
+    } else {
+        /* Expand — insert children right after this row. */
+        FilesSortItem buf[256];
+        int n = 0;
+        wchar_t pattern[MAX_PATH];
+        _snwprintf_s(pattern, MAX_PATH, _TRUNCATE, L"%s\\*",
+                     g_app.filesEntries[idx].fullPath);
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW(pattern, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (wcscmp(fd.cFileName, L".") == 0) continue;
+                if (wcscmp(fd.cFileName, L"..") == 0) continue;
+                if (n >= 256) break;
+                wcscpy_s(buf[n].name, 256, fd.cFileName);
+                buf[n].isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                n++;
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+        qsort(buf, n, sizeof(FilesSortItem), files_sort_cmp);
+        if (g_app.filesCount + n > 512) n = 512 - g_app.filesCount;
+        if (n > 0) {
+            /* Shift down to open a gap */
+            for (int i = g_app.filesCount - 1; i > idx; --i)
+                g_app.filesEntries[i + n] = g_app.filesEntries[i];
+            int childDepth = g_app.filesEntries[idx].depth + 1;
+            for (int i = 0; i < n; ++i) {
+                int slot = idx + 1 + i;
+                wcscpy_s(g_app.filesEntries[slot].name, 256, buf[i].name);
+                _snwprintf_s(g_app.filesEntries[slot].fullPath, MAX_PATH, _TRUNCATE,
+                             L"%s\\%s", g_app.filesEntries[idx].fullPath, buf[i].name);
+                g_app.filesEntries[slot].isDir = buf[i].isDir;
+                g_app.filesEntries[slot].expanded = FALSE;
+                g_app.filesEntries[slot].depth = childDepth;
+            }
+            g_app.filesCount += n;
+        }
+        g_app.filesEntries[idx].expanded = TRUE;
     }
 }
 
@@ -6264,16 +6598,12 @@ static void files_set_dir(const wchar_t* path) {
 static void files_navigate_up(void) {
     wchar_t buf[MAX_PATH];
     str_copy_w(buf, MAX_PATH, g_app.filesDir);
-    /* Strip trailing backslash */
     size_t n = wcslen(buf);
     while (n > 0 && (buf[n-1] == L'\\' || buf[n-1] == L'/')) buf[--n] = 0;
     wchar_t* slash = wcsrchr(buf, L'\\');
     if (!slash) slash = wcsrchr(buf, L'/');
     if (slash && slash != buf) { *slash = 0; files_set_dir(buf); }
-    else if (slash) {
-        /* root drive — keep the backslash */
-        slash[1] = 0; files_set_dir(buf);
-    }
+    else if (slash) { slash[1] = 0; files_set_dir(buf); }
 }
 
 static void on_sidebar_item_activated(int idx) {
@@ -6296,20 +6626,15 @@ static void on_sidebar_item_activated(int idx) {
             c->name, c->kind, c->user, c->host);
         inject_into_active(buf);
     } else if (g_app.sidebarMode == MODE_FILES && idx < g_app.filesCount) {
-        if (idx == 0) {                       /* ".." */
-            files_navigate_up();
+        if (g_app.filesEntries[idx].isDir) {
+            files_toggle(idx);
             InvalidateRect(g_app.hWnd, NULL, FALSE);
-        } else if (g_app.filesIsDir[idx]) {
-            wchar_t nd[MAX_PATH];
-            _snwprintf_s(nd, MAX_PATH, _TRUNCATE, L"%s\\%s",
-                         g_app.filesDir, g_app.filesEntries[idx]);
-            files_set_dir(nd);
-            InvalidateRect(g_app.hWnd, NULL, FALSE);
+        } else if (is_text_file(g_app.filesEntries[idx].fullPath)) {
+            show_editor_preview(g_app.filesEntries[idx].fullPath);
         } else {
-            /* File → inject quoted path into the active terminal */
             wchar_t buf[MAX_PATH + 8];
             _snwprintf_s(buf, MAX_PATH + 8, _TRUNCATE,
-                         L"\"%s\\%s\" ", g_app.filesDir, g_app.filesEntries[idx]);
+                         L"\"%s\" ", g_app.filesEntries[idx].fullPath);
             inject_into_active(buf);
         }
     }
@@ -6480,6 +6805,13 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_app.hFontBig = CreateFontW(-22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
                                          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                          CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+            /* Segoe MDL2 Assets is the modern icon font shipping with all
+             * Windows 10/11 installs. We use it for small UI glyphs (close,
+             * zoom, resize, hamburger) — much cleaner than text/emoji.   */
+            g_app.hFontIcons = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                          SYMBOL_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                          CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                                          L"Segoe MDL2 Assets");
 
             g_app.hStatus = CreateWindowExW(0, STATUSCLASSNAMEW, NULL,
                                             WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
@@ -6739,15 +7071,14 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                                 g_app.splitActiveCell = landedSlot;
                                 schedule_persist();
                             }
-                        } else if (mode == MODE_FILES && idx < g_app.filesCount && idx != 0) {
+                        } else if (mode == MODE_FILES && idx < g_app.filesCount) {
                             wchar_t full[MAX_PATH];
-                            _snwprintf_s(full, MAX_PATH, _TRUNCATE,
-                                L"%s\\%s", g_app.filesDir, g_app.filesEntries[idx]);
-                            if (g_app.filesIsDir[idx]) {
+                            str_copy_w(full, MAX_PATH, g_app.filesEntries[idx].fullPath);
+                            if (g_app.filesEntries[idx].isDir) {
                                 open_new_tab(L"powershell");
                                 int newTab = g_app.tabCount - 1;
                                 Tab* nt = g_app.tabs[newTab];
-                                str_copy_w(nt->title, 128, g_app.filesEntries[idx]);
+                                str_copy_w(nt->title, 128, g_app.filesEntries[idx].name);
                                 str_copy_w(nt->emoji, 8, L"\U0001F4C1");
                                 wchar_t cmd[MAX_PATH + 16];
                                 _snwprintf_s(cmd, MAX_PATH + 16, _TRUNCATE, L"cd \"%s\"\r", full);
@@ -7156,6 +7487,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             DeleteObject(g_app.hFontMonoBold);
             DeleteObject(g_app.hFontEmoji);
             DeleteObject(g_app.hFontBig);
+            DeleteObject(g_app.hFontIcons);
             PostQuitMessage(0);
             return 0;
     }
