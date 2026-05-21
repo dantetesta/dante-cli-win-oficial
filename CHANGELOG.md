@@ -3,6 +3,28 @@
 Formato baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/).
 Versionamento [SemVer](https://semver.org/lang/pt-BR/).
 
+## [1.0.27] — 2026-05-20
+
+### Corrigido
+- **Enter no diálogo de Adicionar** — submetia silenciosamente sem fazer nada. Causa: o EDIT capturava o Enter antes do BS_DEFPUSHBUTTON. Subclasse instalada (`PromptEditSubclass`) intercepta Enter→IDOK e Esc→IDCANCEL. Vale para Adicionar favorito/snippet/credencial e para Renomear aba.
+- **Modo Pastas** agora lista os arquivos de verdade — antes mostrava só um hint. Default = `%USERPROFILE%`. `..` no topo navega pra cima; pasta entra; arquivo injeta o path quoted no terminal ativo. Ordenado case-insensitive. Cap 256 entradas por pasta (suficiente pra navegação humana).
+- Footer da sidebar em modo Pastas vira **"🏠 Ir para Home"** em vez de "⊕ Adicionar".
+
+### Adicionado
+- **Botão "🚪 Sair split"** no toolbar — aparece automaticamente só quando o split está ativo. Restaura o layout single em 1 clique. Antes precisava abrir a galeria e escolher "Sem split".
+- **Botão "✕" no header de cada célula** (split mode) — **remove o terminal do slot** sem fechar a aba. O slot fica vazio (placeholder); a aba continua viva nas tabs.
+- **Overlay grande de gravação por voz** — ao clicar o mic, aparece um painel modal escurecido com:
+  - Ícone 🎤 grande
+  - Título *"Fale agora, estou ouvindo!"*
+  - Subtítulo explicando que a transcrição vai pro terminal ativo
+  - Cronômetro REC em vermelho
+  - Botão *"⏹ Parar e enviar"* — clique para parar e disparar o upload pra Groq Whisper
+  - Durante upload o título vira *"Transcrevendo…"* até a Groq retornar
+  - Clicks sob o overlay são bloqueados pra evitar foco em outro lugar
+
+### Arquitetura
+- `voice_is_recording/uploading/elapsed_ms` accessor wrappers — UI não precisa mais conhecer a `struct Voice` interna.
+
 ## [1.0.26] — 2026-05-20
 
 ### Performance

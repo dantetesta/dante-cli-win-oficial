@@ -74,7 +74,7 @@ static PFN_ClosePseudoConsole  pClosePseudoConsole  = NULL;
  *                              CONSTANTS
  * ========================================================================= */
 
-#define APP_VERSION_W   L"1.0.26"
+#define APP_VERSION_W   L"1.0.27"
 #define APP_NAME_W      L"Dante CLI"
 #define APP_WINDOW_CLS  L"DanteCLIMainWindow"
 
@@ -542,7 +542,14 @@ typedef struct {
     int          zoomedCell;                        /* -1 = no zoom; cell idx otherwise */
     RECT         zoomBtnRect[MAX_SPLIT_CELLS];      /* updated by draw_terminal_header */
     RECT         sizeBtnRect[MAX_SPLIT_CELLS];      /* resize button rects */
+    RECT         unslotBtnRect[MAX_SPLIT_CELLS];    /* "✕" unslot button rects */
     SplitCell    customCells[MAX_SPLIT_CELLS];      /* w==0 → use preset cell */
+    /* Files-mode browser state (sidebar MODE_FILES) */
+    wchar_t      filesDir[MAX_PATH];                /* current folder path */
+    wchar_t      filesEntries[256][MAX_PATH];       /* names of children */
+    BOOL         filesIsDir[256];
+    int          filesCount;
+    int          filesScroll;
 } App;
 
 static App g_app;
@@ -609,6 +616,11 @@ static int  active_tab_index(void);
 static void toggle_zoom(int cellIdx);
 static int  hit_test_zoom_btn(int x, int y);
 static int  hit_test_size_btn(int x, int y);
+static int  hit_test_unslot_btn(int x, int y);
+static void unslot_cell(int cellIdx);
+static void files_refresh(void);
+static void files_set_dir(const wchar_t* path);
+static void files_navigate_up(void);
 static const SplitCell* resolve_cell(int idx);
 static void show_resize_popup(int cellIdx, int screenX, int screenY);
 static RECT split_cell_rect(const RECT* parent, const SplitCell* c);
@@ -1723,6 +1735,24 @@ typedef struct {
 
 static PromptCtx* g_promptCtx = NULL;
 
+/* Subclass the prompt's EDIT control so Enter submits as IDOK. Plain
+ * IsDialogMessage won't fire BS_DEFPUSHBUTTON because our window isn't a
+ * real dialog — the edit captures the keystroke first.                  */
+static WNDPROC g_origPromptEditProc = NULL;
+
+static LRESULT CALLBACK PromptEditSubclass(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_GETDLGCODE) return DLGC_WANTALLKEYS;
+    if (msg == WM_KEYDOWN && wParam == VK_RETURN) {
+        SendMessageW(GetParent(hWnd), WM_COMMAND, MAKEWPARAM(IDOK, 0), 0);
+        return 0;
+    }
+    if (msg == WM_KEYDOWN && wParam == VK_ESCAPE) {
+        SendMessageW(GetParent(hWnd), WM_COMMAND, MAKEWPARAM(IDCANCEL, 0), 0);
+        return 0;
+    }
+    return CallWindowProcW(g_origPromptEditProc, hWnd, msg, wParam, lParam);
+}
+
 static LRESULT CALLBACK PromptWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
@@ -1734,9 +1764,12 @@ static LRESULT CALLBACK PromptWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
             SendMessageW(lbl, WM_SETFONT, (WPARAM)f, TRUE);
 
             g_promptCtx->hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+                WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
                 16, 58, 380, 28, hWnd, (HMENU)100, GetModuleHandleW(NULL), NULL);
             SendMessageW(g_promptCtx->hEdit, WM_SETFONT, (WPARAM)f, TRUE);
+            /* Install the Enter/Escape subclass on the edit. */
+            g_origPromptEditProc = (WNDPROC)SetWindowLongPtrW(
+                g_promptCtx->hEdit, GWLP_WNDPROC, (LONG_PTR)PromptEditSubclass);
 
             g_promptCtx->hOK = CreateWindowExW(0, L"BUTTON", L"OK",
                 WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
@@ -2047,11 +2080,15 @@ static void show_add_dialog(void) {
             str_copy_w(c->emoji, 8, L"\U0001F511");
             break;
         }
-        case MODE_FILES:
+        case MODE_FILES: {
+            /* Navigate to the user's HOME folder. */
+            wchar_t home[MAX_PATH] = {0};
+            SHGetFolderPathW(NULL, CSIDL_PROFILE, NULL, 0, home);
+            files_set_dir(home);
+            InvalidateRect(g_app.hWnd, NULL, FALSE);
+            return;
+        }
         default:
-            MessageBoxW(g_app.hWnd,
-                L"Use Favoritos para guardar pastas frequentes.",
-                APP_NAME_W, MB_ICONINFORMATION);
             return;
     }
     schedule_persist();
@@ -3197,6 +3234,107 @@ static void cheatsheet_toggle(void) {
 
 typedef struct { const wchar_t* keys; const wchar_t* desc; } CheatRow;
 
+/* Voice module functions/state live further down — use accessor wrappers
+ * here so we don't need to forward-declare the whole struct.            */
+static BOOL  voice_is_recording(void);
+static BOOL  voice_is_uploading(void);
+static DWORD voice_elapsed_ms(void);
+static void  voice_stop_and_upload(void);
+
+/* Voice recording / uploading overlay — dim backdrop + big mic + Stop btn. */
+static RECT g_voiceStopBtnRect = {0};
+
+static void draw_voice_overlay(HDC dc, const RECT* cli) {
+    BOOL rec = voice_is_recording();
+    BOOL up  = voice_is_uploading();
+    if (!rec && !up) {
+        SetRectEmpty(&g_voiceStopBtnRect);
+        return;
+    }
+    /* Dim backdrop */
+    HBRUSH dim = CreateSolidBrush(RGB(0,0,0));
+    BLENDFUNCTION bf = { AC_SRC_OVER, 0, 200, 0 };
+    HDC tmp = CreateCompatibleDC(dc);
+    HBITMAP bmp = CreateCompatibleBitmap(dc, cli->right, cli->bottom);
+    HBITMAP oldBmp = (HBITMAP)SelectObject(tmp, bmp);
+    RECT all = *cli; FillRect(tmp, &all, dim);
+    AlphaBlend(dc, 0, 0, cli->right, cli->bottom, tmp, 0, 0, cli->right, cli->bottom, bf);
+    SelectObject(tmp, oldBmp); DeleteObject(bmp); DeleteDC(tmp); DeleteObject(dim);
+
+    /* Panel */
+    int W = 520, H = 280;
+    int x = (cli->right - W) / 2;
+    int y = (cli->bottom - H) / 2;
+    RECT panel = { x, y, x + W, y + H };
+    draw_rounded_rect(dc, panel, COL_BG_SIDE,
+                      rec ? COL_RED : COL_ACCENT, 16);
+
+    /* Big mic icon */
+    HFONT bigEmoji = CreateFontW(-68, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI Emoji");
+    HFONT old = (HFONT)SelectObject(dc, bigEmoji);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, rec ? COL_RED : COL_ACCENT);
+    SIZE sz;
+    GetTextExtentPoint32W(dc, L"\U0001F3A4", 2, &sz);
+    TextOutW(dc, x + ((W - sz.cx) / 2), y + 24, L"\U0001F3A4", 2);
+    SelectObject(dc, old);
+    DeleteObject(bigEmoji);
+
+    /* Title */
+    SetTextColor(dc, COL_FG);
+    HFONT oldB = (HFONT)SelectObject(dc, g_app.hFontBig);
+    const wchar_t* title = rec
+        ? L"Fale agora, estou ouvindo!"
+        : L"Transcrevendo…";
+    GetTextExtentPoint32W(dc, title, (int)wcslen(title), &sz);
+    TextOutW(dc, x + ((W - sz.cx) / 2), y + 116, title, (int)wcslen(title));
+    SelectObject(dc, oldB);
+
+    /* Subtitle + REC timer */
+    HFONT oldU = (HFONT)SelectObject(dc, g_app.hFontUI);
+    SetTextColor(dc, COL_FG_DIM);
+    const wchar_t* sub = rec
+        ? L"O texto reconhecido será inserido no terminal ativo."
+        : L"Aguarde o retorno da Groq Whisper…";
+    GetTextExtentPoint32W(dc, sub, (int)wcslen(sub), &sz);
+    TextOutW(dc, x + ((W - sz.cx) / 2), y + 158, sub, (int)wcslen(sub));
+
+    if (rec) {
+        DWORD secs = voice_elapsed_ms() / 1000;
+        wchar_t t[32];
+        _snwprintf_s(t, 32, _TRUNCATE, L"REC  %02lu:%02lu", secs / 60, secs % 60);
+        SetTextColor(dc, COL_RED);
+        GetTextExtentPoint32W(dc, t, (int)wcslen(t), &sz);
+        TextOutW(dc, x + ((W - sz.cx) / 2), y + 180, t, (int)wcslen(t));
+    }
+    SelectObject(dc, oldU);
+
+    /* Stop / OK button */
+    if (rec) {
+        RECT stop = { x + (W - 220) / 2, y + H - 60, x + (W + 220) / 2, y + H - 24 };
+        draw_rounded_rect(dc, stop, COL_RED, 0, 10);
+        oldB = (HFONT)SelectObject(dc, g_app.hFontUIBold);
+        SetTextColor(dc, RGB(255,255,255));
+        const wchar_t* lbl = L"⏹  Parar e enviar";
+        GetTextExtentPoint32W(dc, lbl, (int)wcslen(lbl), &sz);
+        TextOutW(dc, stop.left + ((stop.right - stop.left) - sz.cx) / 2,
+                 stop.top  + ((stop.bottom - stop.top) - sz.cy) / 2,
+                 lbl, (int)wcslen(lbl));
+        SelectObject(dc, oldB);
+        g_voiceStopBtnRect = stop;
+    } else {
+        SetRectEmpty(&g_voiceStopBtnRect);
+    }
+}
+
+static int hit_test_voice_stop(int x, int y) {
+    RECT r = g_voiceStopBtnRect;
+    if (r.right == r.left || r.bottom == r.top) return 0;
+    return (x >= r.left && x < r.right && y >= r.top && y < r.bottom);
+}
+
 static void draw_cheatsheet(HDC dc, const RECT* cli) {
     static const CheatRow rows[] = {
         { L"Ctrl+T",        L"Nova aba (PowerShell)" },
@@ -3622,6 +3760,10 @@ static Voice g_voice;
 static void voice_init(void) {
     InitializeCriticalSection(&g_voice.lock);
 }
+
+static BOOL  voice_is_recording(void) { return g_voice.recording; }
+static BOOL  voice_is_uploading(void) { return g_voice.uploading; }
+static DWORD voice_elapsed_ms(void)   { return GetTickCount() - g_voice.startTick; }
 
 static void voice_append(const char* data, size_t n) {
     EnterCriticalSection(&g_voice.lock);
@@ -4157,16 +4299,7 @@ static void draw_sidebar(HDC dc, const RECT* rc) {
         case MODE_FAVORITES: itemCount = g_app.favoriteCount; break;
         case MODE_SNIPPETS:  itemCount = g_app.snippetCount;  break;
         case MODE_CREDS:     itemCount = g_app.credCount;     break;
-        case MODE_FILES: {
-            const wchar_t* hint = L"Arraste pastas do Explorer para abrir aqui.\n\n(Visualização básica nesta release; integração completa em breve.)";
-            RECT tip = { rc->left + 16, y, rc->right - 16, rc->bottom - 8 };
-            HFONT old = (HFONT)SelectObject(dc, g_app.hFontUI);
-            SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, COL_FG_DIM);
-            DrawTextW(dc, hint, -1, &tip, DT_WORDBREAK | DT_LEFT);
-            SelectObject(dc, old);
-            return;
-        }
+        case MODE_FILES: itemCount = g_app.filesCount; break;
         default: break;
     }
 
@@ -4183,6 +4316,44 @@ static void draw_sidebar(HDC dc, const RECT* rc) {
         SetTextColor(dc, COL_FG_DIM);
         DrawTextW(dc, empty, -1, &tip, DT_WORDBREAK | DT_LEFT);
         SelectObject(dc, old);
+    } else if (g_app.sidebarMode == MODE_FILES) {
+        /* Show the current directory path at the top, then list. */
+        wchar_t shortPath[64];
+        size_t pl = wcslen(g_app.filesDir);
+        if (pl > 38) {
+            wcscpy_s(shortPath, 64, L"…");
+            wcsncat_s(shortPath, 64, g_app.filesDir + (pl - 37), 37);
+        } else {
+            wcscpy_s(shortPath, 64, g_app.filesDir);
+        }
+        draw_text_w(dc, rc->left + 16, y, shortPath, COL_ACCENT, g_app.hFontUI);
+        y += 22;
+
+        HFONT oldF = (HFONT)SelectObject(dc, g_app.hFontUI);
+        SetBkMode(dc, TRANSPARENT);
+        int rowH = 28;
+        for (int i = 0; i < itemCount && y + rowH < rc->bottom - 48; ++i) {
+            RECT row = { rc->left + 12, y, rc->right - 12, y + rowH - 2 };
+            BOOL hover = (g_app.sidebarItemHoverIdx == i);
+            draw_rounded_rect(dc, row, hover ? COL_BG_CHIP_H : COL_BG_CHIP, 0, 6);
+            const wchar_t* icon = (i == 0) ? L"↰" :
+                                  g_app.filesIsDir[i] ? L"\U0001F4C1" : L"\U0001F4C4";
+            draw_text_w(dc, row.left + 8, row.top + 3,
+                        icon, COL_FG, g_app.hFontEmoji);
+            wchar_t shown[48];
+            size_t nl = wcslen(g_app.filesEntries[i]);
+            if (nl > 30) {
+                wcsncpy_s(shown, 48, g_app.filesEntries[i], 29);
+                shown[29] = L'…'; shown[30] = 0;
+            } else {
+                wcscpy_s(shown, 48, g_app.filesEntries[i]);
+            }
+            draw_text_w(dc, row.left + 36, row.top + 5,
+                        shown, g_app.filesIsDir[i] ? COL_FG : COL_FG_DIM,
+                        g_app.hFontUI);
+            y += rowH;
+        }
+        SelectObject(dc, oldF);
     } else {
         /* Render each item as a card */
         HFONT oldName = (HFONT)SelectObject(dc, g_app.hFontUI);
@@ -4232,14 +4403,16 @@ static void draw_sidebar(HDC dc, const RECT* rc) {
         SelectObject(dc, oldName);
     }
 
-    /* "+ Adicionar" footer button — always present */
+    /* Footer button — text depends on mode. Files mode = navigate to Home. */
     RECT add = { rc->left + 12, rc->bottom - 44, rc->right - 12, rc->bottom - 12 };
     draw_rounded_rect(dc, add, COL_BG_CHIP, COL_ACCENT, 8);
     SIZE sz;
     HFONT old2 = (HFONT)SelectObject(dc, g_app.hFontUI);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, COL_ACCENT);
-    const wchar_t* lbl = L"⊕  Adicionar";
+    const wchar_t* lbl =
+        (g_app.sidebarMode == MODE_FILES) ? L"\U0001F3E0  Ir para Home"
+                                          : L"⊕  Adicionar";
     GetTextExtentPoint32W(dc, lbl, (int)wcslen(lbl), &sz);
     TextOutW(dc, add.left + ((add.right - add.left) - sz.cx) / 2,
              add.top + ((add.bottom - add.top) - sz.cy) / 2,
@@ -4474,9 +4647,28 @@ static void draw_terminal_header(HDC dc, RECT hdr, Tab* t, BOOL hasFocus, int ce
         }
     }
 
-    /* Right-edge buttons cluster: ↔ resize (split only), ⤢ zoom (split only).
-     * Each one stores its hit rect for the global mouse handler.        */
+    /* Right-edge buttons cluster: ✕ unslot (split only), ⇲ resize (split only),
+     * ⤢ zoom (split only). Each stores its hit rect for the global handler. */
     int rightCursor = hdr.right - 10;
+
+    /* Unslot button — removes the tab from this slot without closing it.
+     * The slot becomes empty (placeholder). The Tab stays alive elsewhere. */
+    if (g_app.splitLayout != PRESET_SINGLE && cellIdx >= 0 && cellIdx < MAX_SPLIT_CELLS) {
+        RECT btn = { rightCursor - 28, hdr.top + 6, rightCursor, hdr.bottom - 6 };
+        COLORREF btnBg = mix_color(acc, RGB(0,0,0), 0.35);
+        draw_rounded_rect(dc, btn, btnBg, 0, 8);
+        SIZE sz;
+        HFONT old = (HFONT)SelectObject(dc, g_app.hFontUIBold);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, fg);
+        GetTextExtentPoint32W(dc, L"✕", 1, &sz);
+        TextOutW(dc, btn.left + ((btn.right - btn.left) - sz.cx) / 2,
+                 btn.top  + ((btn.bottom - btn.top) - sz.cy) / 2,
+                 L"✕", 1);
+        SelectObject(dc, old);
+        g_app.unslotBtnRect[cellIdx] = btn;
+        rightCursor = btn.left - 6;
+    }
 
     /* Zoom button */
     if (g_app.splitLayout != PRESET_SINGLE && cellIdx >= 0 && cellIdx < MAX_SPLIT_CELLS) {
@@ -4691,10 +4883,13 @@ static RECT split_cell_rect(const RECT* parent, const SplitCell* c) {
 }
 
 static void draw_terminal(HDC dc, const RECT* rc) {
-    /* Invalidate zoom button rects so stale clicks don't fire after a layout
-     * change. They'll be repopulated by draw_terminal_header below.       */
-    for (int i = 0; i < MAX_SPLIT_CELLS; ++i)
+    /* Invalidate header button rects so stale clicks don't fire after a
+     * layout change. They'll be repopulated by draw_terminal_header below. */
+    for (int i = 0; i < MAX_SPLIT_CELLS; ++i) {
         SetRectEmpty(&g_app.zoomBtnRect[i]);
+        SetRectEmpty(&g_app.sizeBtnRect[i]);
+        SetRectEmpty(&g_app.unslotBtnRect[i]);
+    }
 
     if (g_app.splitLayout == PRESET_SINGLE) {
         draw_terminal_cell(dc, rc, g_app.activeTab, TRUE, -1);
@@ -4748,6 +4943,7 @@ static const ToolbarAction kToolbarActions[] = {
     { L"✂",     L"Limpar",   NULL,       RGB(0xC0, 0xCA, 0xF5), 1 },
     { L"\U0001F4A1", L"Explicar", NULL,       RGB(0xE0, 0xAF, 0x68), 3 },
     { L"▦",     L"Layout",   NULL,       RGB(0xBB, 0x9A, 0xF7), 5 },
+    { L"\U0001F6AA", L"Sair split", NULL,    RGB(0xF7, 0x76, 0x8E), 6 },
     { L"⚙",     L"Config",   NULL,       RGB(0x7A, 0xA2, 0xF7), 4 },
 };
 #define TOOLBAR_ACTION_COUNT (sizeof(kToolbarActions)/sizeof(kToolbarActions[0]))
@@ -4766,6 +4962,10 @@ static void draw_toolbar(HDC dc, const RECT* rc) {
     fill_rect_color(dc, &divTop, COL_DIV);
 
     for (size_t i = 0; i < TOOLBAR_ACTION_COUNT; ++i) {
+        /* "Sair split" only appears when split is active. */
+        if (kToolbarActions[i].action == 6 && g_app.splitLayout == PRESET_SINGLE)
+            continue;
+
         RECT br;
         toolbar_action_rect((int)i, rc, &br);
 
@@ -4882,6 +5082,24 @@ static int hit_test_size_btn(int x, int y) {
         if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return i;
     }
     return -1;
+}
+
+static int hit_test_unslot_btn(int x, int y) {
+    for (int i = 0; i < MAX_SPLIT_CELLS; ++i) {
+        RECT r = g_app.unslotBtnRect[i];
+        if (r.right == r.left || r.bottom == r.top) continue;
+        if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return i;
+    }
+    return -1;
+}
+
+/* Empty the slot without closing the Tab. The tab stays alive elsewhere. */
+static void unslot_cell(int cellIdx) {
+    if (cellIdx < 0 || cellIdx >= MAX_SPLIT_CELLS) return;
+    g_app.splitSlots[cellIdx] = -1;
+    if (g_app.zoomedCell == cellIdx) g_app.zoomedCell = -1;
+    InvalidateRect(g_app.hWnd, NULL, FALSE);
+    schedule_persist();
 }
 
 /* ---- Resize popup --------------------------------------------------- */
@@ -5127,8 +5345,10 @@ static int hit_test_sidebar_mode(int x, int y, const RECT* rc) {
     return -1;
 }
 static int hit_test_sidebar_item(int x, int y, const RECT* rc) {
-    int top = rc->top + SIDEBAR_HDR_H + 76;   /* y where item list starts */
-    int rowH = 46;
+    int rowH = (g_app.sidebarMode == MODE_FILES) ? 28 : 46;
+    /* Files mode has a small "current path" header above the list. */
+    int extraHdr = (g_app.sidebarMode == MODE_FILES) ? 22 : 0;
+    int top = rc->top + SIDEBAR_HDR_H + 76 + extraHdr;
     int bottom = rc->bottom - 48;
     if (x < rc->left + 12 || x > rc->right - 12) return -1;
     if (y < top || y >= bottom) return -1;
@@ -5137,6 +5357,7 @@ static int hit_test_sidebar_item(int x, int y, const RECT* rc) {
     if (g_app.sidebarMode == MODE_FAVORITES) count = g_app.favoriteCount;
     else if (g_app.sidebarMode == MODE_SNIPPETS) count = g_app.snippetCount;
     else if (g_app.sidebarMode == MODE_CREDS)    count = g_app.credCount;
+    else if (g_app.sidebarMode == MODE_FILES)    count = g_app.filesCount;
     if (idx < 0 || idx >= count) return -1;
     return idx;
 }
@@ -5144,6 +5365,84 @@ static int hit_test_sidebar_item(int x, int y, const RECT* rc) {
 static int hit_test_sidebar_add(int x, int y, const RECT* rc) {
     return (x >= rc->left + 12 && x < rc->right - 12 &&
             y >= rc->bottom - 44 && y < rc->bottom - 12);
+}
+
+/* --------- Files mode: list/refresh/navigate the filesystem -------- */
+
+static int wstr_cmp_ci(const void* a, const void* b) {
+    return _wcsicmp((const wchar_t*)a, (const wchar_t*)b);
+}
+
+static void files_set_dir(const wchar_t* path);
+
+static void files_refresh(void) {
+    g_app.filesCount = 0;
+    g_app.filesScroll = 0;
+
+    if (!g_app.filesDir[0]) {
+        /* First open — default to user home */
+        SHGetFolderPathW(NULL, CSIDL_PROFILE, NULL, 0, g_app.filesDir);
+    }
+
+    wchar_t pattern[MAX_PATH];
+    _snwprintf_s(pattern, MAX_PATH, _TRUNCATE, L"%s\\*", g_app.filesDir);
+
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    /* Slot 0 reserved for ".." parent navigation. */
+    wcscpy_s(g_app.filesEntries[g_app.filesCount], MAX_PATH, L"..");
+    g_app.filesIsDir[g_app.filesCount] = TRUE;
+    g_app.filesCount++;
+
+    do {
+        if (wcscmp(fd.cFileName, L".")  == 0) continue;
+        if (wcscmp(fd.cFileName, L"..") == 0) continue;
+        if (g_app.filesCount >= 256) break;
+        wcscpy_s(g_app.filesEntries[g_app.filesCount], MAX_PATH, fd.cFileName);
+        g_app.filesIsDir[g_app.filesCount] =
+            (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        g_app.filesCount++;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+
+    /* Sort entries [1..count] case-insensitive (slot 0 stays ".."). */
+    if (g_app.filesCount > 2) {
+        qsort(g_app.filesEntries[1],
+              g_app.filesCount - 1,
+              MAX_PATH * sizeof(wchar_t),
+              wstr_cmp_ci);
+        /* Re-derive isDir flags after sort: re-stat each entry. */
+        for (int i = 1; i < g_app.filesCount; ++i) {
+            wchar_t full[MAX_PATH];
+            _snwprintf_s(full, MAX_PATH, _TRUNCATE, L"%s\\%s",
+                         g_app.filesDir, g_app.filesEntries[i]);
+            DWORD a = GetFileAttributesW(full);
+            g_app.filesIsDir[i] = (a != INVALID_FILE_ATTRIBUTES) &&
+                                  (a & FILE_ATTRIBUTE_DIRECTORY);
+        }
+    }
+}
+
+static void files_set_dir(const wchar_t* path) {
+    str_copy_w(g_app.filesDir, MAX_PATH, path);
+    files_refresh();
+}
+
+static void files_navigate_up(void) {
+    wchar_t buf[MAX_PATH];
+    str_copy_w(buf, MAX_PATH, g_app.filesDir);
+    /* Strip trailing backslash */
+    size_t n = wcslen(buf);
+    while (n > 0 && (buf[n-1] == L'\\' || buf[n-1] == L'/')) buf[--n] = 0;
+    wchar_t* slash = wcsrchr(buf, L'\\');
+    if (!slash) slash = wcsrchr(buf, L'/');
+    if (slash && slash != buf) { *slash = 0; files_set_dir(buf); }
+    else if (slash) {
+        /* root drive — keep the backslash */
+        slash[1] = 0; files_set_dir(buf);
+    }
 }
 
 static void on_sidebar_item_activated(int idx) {
@@ -5165,11 +5464,31 @@ static void on_sidebar_item_activated(int idx) {
             L"# === fim ===\r",
             c->name, c->kind, c->user, c->host);
         inject_into_active(buf);
+    } else if (g_app.sidebarMode == MODE_FILES && idx < g_app.filesCount) {
+        if (idx == 0) {                       /* ".." */
+            files_navigate_up();
+            InvalidateRect(g_app.hWnd, NULL, FALSE);
+        } else if (g_app.filesIsDir[idx]) {
+            wchar_t nd[MAX_PATH];
+            _snwprintf_s(nd, MAX_PATH, _TRUNCATE, L"%s\\%s",
+                         g_app.filesDir, g_app.filesEntries[idx]);
+            files_set_dir(nd);
+            InvalidateRect(g_app.hWnd, NULL, FALSE);
+        } else {
+            /* File → inject quoted path into the active terminal */
+            wchar_t buf[MAX_PATH + 8];
+            _snwprintf_s(buf, MAX_PATH + 8, _TRUNCATE,
+                         L"\"%s\\%s\" ", g_app.filesDir, g_app.filesEntries[idx]);
+            inject_into_active(buf);
+        }
     }
 }
 
 static int hit_test_toolbar_action(int x, int y, const RECT* rc) {
     for (int i = 0; i < (int)TOOLBAR_ACTION_COUNT; ++i) {
+        /* Skip hidden "Sair split" when not in split mode. */
+        if (kToolbarActions[i].action == 6 && g_app.splitLayout == PRESET_SINGLE)
+            continue;
         RECT br; toolbar_action_rect(i, rc, &br);
         if (x >= br.left && x < br.right && y >= br.top && y < br.bottom) return i;
     }
@@ -5288,6 +5607,9 @@ static void perform_toolbar_action(int idx) {
             }
             break;
         }
+        case 6:   /* Sair do split */
+            set_split_layout(PRESET_SINGLE);
+            break;
     }
 }
 
@@ -5402,6 +5724,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             draw_toolbar(mem, &toolbarRc);
 
             if (g_app.cheatsheetVisible) draw_cheatsheet(mem, &cli);
+            if (voice_is_recording() || voice_is_uploading()) draw_voice_overlay(mem, &cli);
 
             BitBlt(hdc, 0, 0, cli.right, cli.bottom, mem, 0, 0, SRCCOPY);
 
@@ -5420,8 +5743,21 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
             if (g_app.cheatsheetVisible) { cheatsheet_toggle(); return 0; }
 
+            /* Voice overlay click handling — Stop button stops recording. */
+            if (voice_is_recording() || voice_is_uploading()) {
+                if (hit_test_voice_stop(x, y)) { voice_stop_and_upload(); return 0; }
+                return 0;
+            }
+
             int mode = hit_test_sidebar_mode(x, y, &sideRc);
-            if (mode >= 0) { g_app.sidebarMode = (SidebarMode)mode; InvalidateRect(hWnd, NULL, FALSE); return 0; }
+            if (mode >= 0) {
+                g_app.sidebarMode = (SidebarMode)mode;
+                if (g_app.sidebarMode == MODE_FILES && g_app.filesCount == 0) {
+                    files_refresh();
+                }
+                InvalidateRect(hWnd, NULL, FALSE);
+                return 0;
+            }
 
             if (hit_test_sidebar_add(x, y, &sideRc)) { show_add_dialog(); return 0; }
 
@@ -5440,7 +5776,11 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
                 update_status();
                 return 0;
             }
-            /* Zoom button on any cell header has top priority. */
+            /* Header buttons (split mode) — top priority. */
+            {
+                int uc = hit_test_unslot_btn(x, y);
+                if (uc >= 0) { unslot_cell(uc); return 0; }
+            }
             {
                 int zc = hit_test_zoom_btn(x, y);
                 if (zc >= 0) { toggle_zoom(zc); return 0; }
